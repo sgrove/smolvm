@@ -2516,6 +2516,58 @@ mod tests {
     }
 
     #[test]
+    fn branch_reuse_checkpoint_is_explicit_for_single_batch_and_held(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Intent: docs/reuse-checkpoint-20260921.md. Parser only: no VM effects.
+        for argv in [
+            vec![
+                "machine",
+                "branch",
+                "--from",
+                "base",
+                "--name",
+                "worker",
+                "--reuse-checkpoint",
+            ],
+            vec![
+                "machine",
+                "fork",
+                "--golden",
+                "base",
+                "--name-prefix",
+                "worker",
+                "--count",
+                "2",
+                "--reuse-checkpoint",
+            ],
+            vec![
+                "machine",
+                "branch",
+                "--from",
+                "base",
+                "--name",
+                "worker",
+                "--hold",
+                "--reuse-checkpoint",
+            ],
+        ] {
+            match TestMachineCli::try_parse_from(argv)?.command {
+                MachineCmd::Branch(cmd) => assert!(cmd.reuse_checkpoint),
+                _ => return Err("expected branch command".into()),
+            }
+        }
+        match TestMachineCli::try_parse_from([
+            "machine", "branch", "--from", "base", "--name", "worker",
+        ])?
+        .command
+        {
+            MachineCmd::Branch(cmd) => assert!(!cmd.reuse_checkpoint),
+            _ => return Err("expected branch command".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn branch_accepts_single_batch_and_legacy_fork_forms() {
         let single =
             TestMachineCli::parse_from(["machine", "branch", "--from", "base", "--name", "worker"]);
@@ -4173,6 +4225,12 @@ pub struct ForkCmd {
     #[arg(long = "from", visible_alias = "golden", value_name = "NAME")]
     pub golden: String,
 
+    /// Reuse the exact source process's retained checkpoint without recapturing.
+    /// Missing or stale checkpoints refuse instead of capturing current state.
+    /// Intent: docs/reuse-checkpoint-20260921.md.
+    #[arg(long)]
+    pub reuse_checkpoint: bool,
+
     /// Name for the new child machine.
     #[arg(short = 'n', long = "name", value_name = "NAME")]
     pub clone: Option<String>,
@@ -4334,6 +4392,7 @@ impl ForkCmd {
                 &self.golden,
                 &clone,
                 vm_common::ForkVmOptions {
+                    reuse_checkpoint: self.reuse_checkpoint,
                     clone_forkable: self.forkable,
                     pinned_ports: &ports,
                     share_weights: self.share_weights,
@@ -4406,6 +4465,7 @@ impl ForkCmd {
             &self.golden,
             &clones,
             vm_common::ForkBatchOptions {
+                reuse_checkpoint: self.reuse_checkpoint,
                 share_weights: self.share_weights,
                 fork_secrets: &fork_secrets,
                 wait_ready,
