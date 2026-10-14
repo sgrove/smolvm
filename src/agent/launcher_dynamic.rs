@@ -840,6 +840,7 @@ pub fn launch_agent_vm_dynamic(
     env_strings.extend(crate::agent::guest_network_env(
         guest_network,
         config.resources.dns,
+        &config.resources.dns_options,
     ));
 
     let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();

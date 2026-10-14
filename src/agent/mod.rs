@@ -197,6 +197,7 @@ fn gpu_virgl_flags() -> u32 {
 pub(crate) fn guest_network_env(
     guest_network: Option<smolvm_network::GuestNetworkConfig>,
     dns_override: Option<std::net::Ipv4Addr>,
+    dns_options: &[String],
 ) -> Vec<std::ffi::CString> {
     use smolvm_protocol::guest_env;
     let mut env: Vec<std::ffi::CString> = Vec::new();
@@ -230,6 +231,11 @@ pub(crate) fn guest_network_env(
     .addr
     {
         push(guest_env::DNS, dns.to_string());
+    }
+    // Resolver options (`--dns-option`) apply to whichever resolver the guest
+    // ends up with; the agent renders them into every resolv.conf it writes.
+    if !dns_options.is_empty() {
+        push(guest_env::DNS_OPTIONS, dns_options.join(" "));
     }
     env
 }
@@ -276,5 +282,34 @@ mod display_size_tests {
         assert_eq!(parse_display_size(Some("1920x0")), None);
         assert_eq!(parse_display_size(Some("99999x1080")), None);
         assert_eq!(parse_display_size(Some("1920x99999")), None);
+    }
+}
+
+#[cfg(test)]
+mod guest_network_env_tests {
+    use super::guest_network_env;
+    use smolvm_protocol::guest_env;
+
+    fn value(env: &[std::ffi::CString], key: &str) -> Option<String> {
+        env.iter()
+            .filter_map(|entry| entry.to_str().ok())
+            .find_map(|entry| entry.strip_prefix(&format!("{key}=")).map(str::to_string))
+    }
+
+    // `--dns-option` reaches the agent as one ordered, space-separated value;
+    // with none set, the variable is absent (the agent then writes no
+    // `options` line, the pre-flag file).
+    #[test]
+    fn dns_options_travel_in_order_only_when_set() {
+        let options = ["timeout:1", "attempts:3", "rotate", "use-vc"].map(String::from);
+        let env = guest_network_env(None, None, &options);
+        assert_eq!(
+            value(&env, guest_env::DNS_OPTIONS).as_deref(),
+            Some("timeout:1 attempts:3 rotate use-vc")
+        );
+        assert_eq!(
+            value(&guest_network_env(None, None, &[]), guest_env::DNS_OPTIONS),
+            None
+        );
     }
 }

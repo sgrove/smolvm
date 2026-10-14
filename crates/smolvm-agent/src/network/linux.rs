@@ -312,7 +312,14 @@ fn add_default_route_v6(gateway: Ipv6Addr) -> Result<(), String> {
 /// DNS configuration in a minimal Linux guest is usually conveyed through
 /// `/etc/resolv.conf`, and that is enough for the MVP.
 fn write_resolv_conf(dns_server: Ipv4Addr) -> Result<(), String> {
-    let contents = format!("nameserver {}\n", dns_server);
+    // `--dns-option` resolver options ride on this file too (one renderer for
+    // every writer, see `smolvm_protocol::resolv`).
+    let value = std::env::var(smolvm_protocol::guest_env::DNS_OPTIONS).unwrap_or_default();
+    let (options, rejected) = smolvm_protocol::resolv::parse_options(&value);
+    for reason in rejected {
+        tracing::warn!(%reason, "ignoring resolver option");
+    }
+    let contents = smolvm_protocol::resolv::render(&[dns_server.to_string()], &options);
     let direct_err = match std::fs::write("/etc/resolv.conf", &contents) {
         Ok(()) => return Ok(()),
         Err(err) => err,

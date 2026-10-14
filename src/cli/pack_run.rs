@@ -285,6 +285,11 @@ pub struct PackRunCmd {
     #[arg(long, value_name = "IP", help_heading = "Network")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Resolver option for the guest resolv.conf (repeatable, in order); see
+    /// `machine create --dns-option`.
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = crate::cli::machine::parse_dns_option, help_heading = "Network")]
+    pub dns_option: Vec<String>,
+
     /// Number of virtual CPUs (overrides manifest default)
     #[arg(long, value_name = "N", help_heading = "Resources")]
     pub cpus: Option<u8>,
@@ -575,6 +580,7 @@ impl PackRunCmd {
             ),
             network_backend: self.net_backend,
             dns: self.dns,
+            dns_options: self.dns_option.clone(),
             network_name: None,
             guest_subnet: None,
             gpu: manifest.gpu,
@@ -1687,6 +1693,7 @@ fn run_ephemeral(
                 net_backend: args.net_backend,
                 ssh_agent: args.ssh_agent,
                 dns: args.dns,
+                dns_option: Vec::new(),
                 cpus: args.cpus,
                 mem: args.mem,
                 storage: args.storage,
@@ -1832,6 +1839,7 @@ fn run_from_cache(
         network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
         dns: args.dns,
+        dns_options: Vec::new(),
         network_name: None,
         guest_subnet: None,
         gpu: manifest.gpu,
@@ -2278,6 +2286,7 @@ fn daemon_start(
         network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
         dns: args.dns,
+        dns_options: Vec::new(),
         network_name: None,
         guest_subnet: None,
         gpu: manifest.gpu,

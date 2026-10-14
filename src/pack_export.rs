@@ -503,6 +503,7 @@ impl ExportVm {
                 network,
                 network_backend: None,
                 dns,
+                dns_options: Vec::new(),
                 gpu: false,
                 cuda: false,
                 gpu_vram_mib: None,

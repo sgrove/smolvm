@@ -4121,13 +4121,27 @@ fn overlay_resolv_conf_contents() -> String {
     // backend: under virtio-net it's the gateway address, and under TSI it's a
     // custom resolver (--dns) the guest queries directly. Only fall back to
     // public resolvers when the host didn't specify one.
+    // Resolver options (`--dns-option`) ride on every non-filtered file; the
+    // filter proxy above answers datagrams only, so it gets none.
+    let options = overlay_resolv_options();
     if let Ok(dns_server) = std::env::var(guest_env::DNS) {
-        if !dns_server.is_empty() {
-            return format!("nameserver {}\n", dns_server);
+        if !dns_server.trim().is_empty() {
+            return smolvm_protocol::resolv::render(&[dns_server.trim()], &options);
         }
     }
 
-    "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string()
+    // Same order as the TSI boot path (`tsi_resolv_conf`): the two writers
+    // used to disagree (8.8.8.8 first here, 1.1.1.1 first at boot).
+    smolvm_protocol::resolv::render(&smolvm_protocol::resolv::DEFAULT_NAMESERVERS, &options)
+}
+
+fn overlay_resolv_options() -> Vec<String> {
+    let value = std::env::var(guest_env::DNS_OPTIONS).unwrap_or_default();
+    let (accepted, rejected) = smolvm_protocol::resolv::parse_options(&value);
+    for reason in rejected {
+        warn!(%reason, "ignoring resolver option");
+    }
+    accepted
 }
 
 /// Default /etc/hosts for images that ship without one, mirroring the file
@@ -7305,11 +7319,42 @@ mod tests {
         std::env::remove_var(guest_env::DNS_FILTER);
         std::env::remove_var(guest_env::BACKEND);
         std::env::remove_var(guest_env::DNS);
+        std::env::remove_var(guest_env::DNS_OPTIONS);
+
+        // Same order as the TSI boot repair (`tsi_resolv_conf`).
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+        );
+    }
+
+    #[test]
+    fn overlay_resolv_conf_carries_resolver_options_except_under_the_filter() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::BACKEND);
+        std::env::remove_var(guest_env::DNS);
+        std::env::set_var(
+            guest_env::DNS_OPTIONS,
+            "timeout:1 attempts:3 rotate use-vc bogus",
+        );
 
         assert_eq!(
             overlay_resolv_conf_contents(),
-            "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:1 attempts:3 rotate use-vc\n"
         );
+        std::env::set_var(guest_env::DNS, "100.100.100.100");
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 100.100.100.100\noptions timeout:1 attempts:3 rotate use-vc\n"
+        );
+        // The filter proxy answers datagrams only: no options under it.
+        std::env::set_var(guest_env::DNS_FILTER, "1");
+        assert_eq!(overlay_resolv_conf_contents(), "nameserver 127.0.0.1\n");
+
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::DNS);
+        std::env::remove_var(guest_env::DNS_OPTIONS);
     }
 
     #[test]

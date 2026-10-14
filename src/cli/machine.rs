@@ -639,6 +639,12 @@ pub struct RunCmd {
     #[arg(long, value_name = "IP", help_heading = "Network")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Resolver option for the guest resolv.conf (repeatable, in order), e.g.
+    /// `--dns-option timeout:1 --dns-option use-vc`. Written as one `options`
+    /// line by every guest writer of resolv.conf (see `resolv.conf(5)`).
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option, help_heading = "Network")]
+    pub dns_option: Vec<String>,
+
     /// IPv4 subnet for the guest link, e.g. 10.200.0.0/30 (implies --net,
     /// virtio-net). The gateway and resolver take the first address, the guest
     /// the second. Use it when the guest runs Tailscale or another VPN that
@@ -1165,6 +1171,10 @@ fn ensure_init_layer(
             create.push("--dns".into());
             create.push(dns.to_string());
         }
+        for option in &params.dns_options {
+            create.push("--dns-option".into());
+            create.push(option.clone());
+        }
         if let Some(subnet) = &params.guest_subnet {
             create.push("--guest-subnet".into());
             create.push(subnet.clone());
@@ -1345,6 +1355,7 @@ impl RunCmd {
                 net_backend: self.net_backend,
                 ssh_agent: self.ssh_agent,
                 dns: self.dns,
+                dns_option: self.dns_option.clone(),
                 cpus: self.cpus,
                 mem: self.mem,
                 storage: self.storage,
@@ -1428,8 +1439,9 @@ impl RunCmd {
             // `machine create` is the path an orchestrator labels.
             Default::default(),
         )?;
-
         let mut params = params;
+        // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
+        params.dns_options = self.dns_option.clone();
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
@@ -1519,6 +1531,7 @@ impl RunCmd {
                     net_backend: params.network_backend,
                     ssh_agent: self.ssh_agent || params.ssh_agent,
                     dns: params.dns,
+                    dns_option: params.dns_options.clone(),
                     cpus: Some(params.cpus),
                     mem: Some(params.mem),
                     storage: params.storage_gb,
@@ -1675,6 +1688,7 @@ impl RunCmd {
                 net_backend: params.network_backend,
                 ssh_agent: self.ssh_agent || params.ssh_agent,
                 dns: params.dns,
+                dns_option: params.dns_options.clone(),
                 cpus: Some(params.cpus),
                 mem: Some(params.mem),
                 storage: params.storage_gb,
@@ -1800,6 +1814,7 @@ impl RunCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             // CLI --gpu wins; Smolfile gpu = true also enables it.
@@ -2776,6 +2791,46 @@ mod tests {
     struct TestMachineCli {
         #[command(subcommand)]
         command: MachineCmd,
+    }
+
+    #[test]
+    fn create_takes_repeatable_dns_options_in_order_and_refuses_unknown_ones() {
+        let cli = TestMachineCli::try_parse_from([
+            "machine",
+            "create",
+            "--name",
+            "dns-1",
+            "--dns-option",
+            "timeout:1",
+            "--dns-option",
+            "attempts:3",
+            "--dns-option",
+            "rotate",
+            "--dns-option",
+            "use-vc",
+        ])
+        .unwrap();
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create");
+        };
+        assert_eq!(
+            cmd.dns_option,
+            ["timeout:1", "attempts:3", "rotate", "use-vc"]
+        );
+        for bad in ["bogus", "timeout:0", "rotate:1", "options timeout:1"] {
+            assert!(
+                TestMachineCli::try_parse_from([
+                    "machine",
+                    "create",
+                    "--name",
+                    "dns-2",
+                    "--dns-option",
+                    bad
+                ])
+                .is_err(),
+                "{bad:?} must be refused at the command line"
+            );
+        }
     }
 
     #[test]
@@ -3980,6 +4035,12 @@ pub struct CreateCmd {
     #[arg(long, value_name = "IP")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Resolver option for the guest resolv.conf (repeatable, in order), e.g.
+    /// `--dns-option timeout:1 --dns-option use-vc`. Written as one `options`
+    /// line by every guest writer of resolv.conf (see `resolv.conf(5)`).
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option)]
+    pub dns_option: Vec<String>,
+
     /// IPv4 subnet for the guest link, e.g. 10.200.0.0/30 (implies --net,
     /// virtio-net). The gateway and resolver take the first address, the guest
     /// the second. Use it when the guest runs Tailscale or another VPN that
@@ -4283,6 +4344,8 @@ impl CreateCmd {
             smolvm::util::parse_labels(&self.labels)?,
         )?;
         let mut params = params;
+        // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
+        params.dns_options = self.dns_option.clone();
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
@@ -4338,6 +4401,7 @@ impl CreateCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             gpu: params.gpu,
@@ -4689,6 +4753,7 @@ impl CreateCmd {
             net: network,
             network_backend: checkpoint_backend.or(self.net_backend),
             dns: self.dns,
+            dns_options: self.dns_option.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: checkpoint_subnet.or_else(|| self.guest_subnet.clone()),
             init: self.init.clone(),
@@ -4771,6 +4836,7 @@ impl CreateCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             gpu: params.gpu,
@@ -7242,4 +7308,10 @@ impl MonitorCmd {
         );
         Ok(())
     }
+}
+
+/// clap value parser for `--dns-option`: the same validation the guest agent
+/// applies, so an option the agent would drop is refused at the command line.
+pub(crate) fn parse_dns_option(value: &str) -> Result<String, String> {
+    smolvm_protocol::resolv::validate_option(value).map(|()| value.to_string())
 }

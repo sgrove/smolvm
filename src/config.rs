@@ -579,6 +579,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Resolver options for the guest resolv.conf (`--dns-option`), in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_options: Vec<String>,
+
     /// Named inter-VM network this machine joins on start (virtio-net only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
@@ -902,6 +906,7 @@ impl VmRecord {
             egress_rules: Vec::new(),
             network_backend: None,
             dns: None,
+            dns_options: Vec::new(),
             network_name: None,
             guest_subnet: None,
             image: None,
@@ -994,6 +999,7 @@ impl VmRecord {
             egress_rules: Vec::new(),
             network_backend: None,
             dns: None,
+            dns_options: Vec::new(),
             network_name: None,
             guest_subnet: None,
             image: None,
@@ -1519,6 +1525,7 @@ impl VmRecord {
             allowed_cidrs: self.allowed_cidrs.clone(),
             egress_rules: self.egress_rules.clone(),
             dns: self.dns,
+            dns_options: self.dns_options.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),
         }
@@ -1534,6 +1541,26 @@ mod tests {
         let mut r = VmRecord::new("m".to_string(), 1, 512, vec![], ports, network);
         r.image = Some(image.to_string());
         r
+    }
+
+    // A record written before `--dns-option` existed still loads (no options),
+    // and a record's options reach the launch resources in order.
+    #[test]
+    fn dns_options_persist_on_the_record_and_reach_launch_resources() {
+        let mut record = VmRecord::new("d".to_string(), 1, 512, vec![], vec![], true);
+        let mut old = serde_json::to_value(&record).unwrap();
+        assert!(
+            old.get("dns_options").is_none(),
+            "empty options are not written"
+        );
+        old.as_object_mut().unwrap().remove("dns_options");
+        let loaded: VmRecord = serde_json::from_value(old).unwrap();
+        assert!(loaded.dns_options.is_empty());
+
+        record.dns_options = vec!["timeout:1".into(), "use-vc".into()];
+        let loaded: VmRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        assert_eq!(loaded.vm_resources().dns_options, ["timeout:1", "use-vc"]);
     }
 
     #[test]

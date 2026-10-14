@@ -145,6 +145,10 @@ pub struct VmResources {
     /// blocks the default resolver (e.g. 8.8.8.8) still resolve names.
     #[serde(default)]
     pub dns: Option<std::net::Ipv4Addr>,
+    /// Resolver options for the guest resolv.conf (`--dns-option`), in order.
+    /// Empty = none. Validated with `smolvm_protocol::resolv::validate_option`.
+    #[serde(default)]
+    pub dns_options: Vec<String>,
     /// Named inter-VM network to join (virtio-net only). Members lease
     /// distinct guest addresses and route IP packets to each other through
     /// the host-side fabric; VMs on different networks (or none) stay fully
@@ -239,6 +243,7 @@ impl Default for VmResources {
             allowed_cidrs: None,
             egress_rules: Vec::new(),
             dns: None,
+            dns_options: Vec::new(),
             network_name: None,
             guest_subnet: None,
         }
