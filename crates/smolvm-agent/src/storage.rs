@@ -4113,17 +4113,17 @@ fn refresh_overlay_resolver(root: &Path) -> Result<()> {
 }
 
 fn overlay_resolv_conf_contents() -> String {
+    // Resolver options (`--dns-option`) ride on every file, the filter proxy's
+    // included: it answers on both UDP and TCP, so even `use-vc` works there.
+    let options = crate::resolv_options();
     if std::env::var(guest_env::DNS_FILTER).as_deref() == Ok("1") {
-        return "nameserver 127.0.0.1\n".to_string();
+        return smolvm_protocol::resolv::render(&["127.0.0.1"], &options);
     }
 
     // A nameserver supplied by the host (SMOLVM_NETWORK_DNS) wins for either
     // backend: under virtio-net it's the gateway address, and under TSI it's a
     // custom resolver (--dns) the guest queries directly. Only fall back to
     // public resolvers when the host didn't specify one.
-    // Resolver options (`--dns-option`) ride on every non-filtered file; the
-    // filter proxy above answers datagrams only, so it gets none.
-    let options = overlay_resolv_options();
     if let Ok(dns_server) = std::env::var(guest_env::DNS) {
         if !dns_server.trim().is_empty() {
             return smolvm_protocol::resolv::render(&[dns_server.trim()], &options);
@@ -4133,15 +4133,6 @@ fn overlay_resolv_conf_contents() -> String {
     // Same order as the TSI boot path (`tsi_resolv_conf`): the two writers
     // used to disagree (8.8.8.8 first here, 1.1.1.1 first at boot).
     smolvm_protocol::resolv::render(&smolvm_protocol::resolv::DEFAULT_NAMESERVERS, &options)
-}
-
-fn overlay_resolv_options() -> Vec<String> {
-    let value = std::env::var(guest_env::DNS_OPTIONS).unwrap_or_default();
-    let (accepted, rejected) = smolvm_protocol::resolv::parse_options(&value);
-    for reason in rejected {
-        warn!(%reason, "ignoring resolver option");
-    }
-    accepted
 }
 
 /// Default /etc/hosts for images that ship without one, mirroring the file
@@ -7329,7 +7320,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_resolv_conf_carries_resolver_options_except_under_the_filter() {
+    fn overlay_resolv_conf_carries_resolver_options_on_every_path() {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(guest_env::DNS_FILTER);
         std::env::remove_var(guest_env::BACKEND);
@@ -7348,9 +7339,12 @@ mod tests {
             overlay_resolv_conf_contents(),
             "nameserver 100.100.100.100\noptions timeout:1 attempts:3 rotate use-vc\n"
         );
-        // The filter proxy answers datagrams only: no options under it.
+        // The filter proxy answers on UDP and TCP, so it gets the options too.
         std::env::set_var(guest_env::DNS_FILTER, "1");
-        assert_eq!(overlay_resolv_conf_contents(), "nameserver 127.0.0.1\n");
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 127.0.0.1\noptions timeout:1 attempts:3 rotate use-vc\n"
+        );
 
         std::env::remove_var(guest_env::DNS_FILTER);
         std::env::remove_var(guest_env::DNS);

@@ -82,6 +82,27 @@ pub fn render<S: AsRef<str>>(nameservers: &[S], options: &[String]) -> String {
     out
 }
 
+/// `current` with its `options` lines replaced by one line of `options`.
+/// Every other line (`nameserver`, `search`, `domain`, `sortlist`, comments)
+/// is kept in order, so adding options never costs a host its search domains.
+pub fn with_options(current: &str, options: &[String]) -> String {
+    let mut out = String::new();
+    for line in current.lines() {
+        let keyword = line.split_whitespace().next();
+        if keyword == Some("options") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !options.is_empty() {
+        out.push_str("options ");
+        out.push_str(&options.join(" "));
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +147,24 @@ mod tests {
         ] {
             assert!(validate_option(bad).is_err(), "{bad:?}");
         }
+    }
+
+    // A host-written file keeps its search domains and other lines; only its
+    // `options` lines are replaced, so a VPN or corporate resolver still works.
+    #[test]
+    fn with_options_replaces_only_the_options_lines() {
+        let options = vec!["timeout:1".to_string(), "use-vc".to_string()];
+        assert_eq!(
+            with_options(
+                "# from host\nsearch corp.example\nnameserver 10.0.0.2\noptions ndots:5\n",
+                &options
+            ),
+            "# from host\nsearch corp.example\nnameserver 10.0.0.2\noptions timeout:1 use-vc\n"
+        );
+        assert_eq!(
+            with_options("nameserver 10.0.0.2\n", &options),
+            "nameserver 10.0.0.2\noptions timeout:1 use-vc\n"
+        );
     }
 
     #[test]

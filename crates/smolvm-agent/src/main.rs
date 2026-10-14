@@ -206,7 +206,8 @@ fn boottime_ms() -> u64 {
 ///
 /// `options` (from `--dns-option`) are appended as one `options` line to
 /// whatever this writes; with options set, a host-written file that lacks
-/// them is rewritten so the options always reach the guest's resolver.
+/// them gets its `options` line replaced and every other line (search
+/// domains included) kept, so the options always reach the guest's resolver.
 fn tsi_resolv_conf(
     dns_override: Option<&str>,
     current: &str,
@@ -218,13 +219,7 @@ fn tsi_resolv_conf(
             smolvm_protocol::resolv::render(&smolvm_protocol::resolv::DEFAULT_NAMESERVERS, options),
         ),
         _ if !options.is_empty() => {
-            let servers: Vec<&str> = current
-                .lines()
-                .filter_map(|line| line.trim().strip_prefix("nameserver"))
-                .map(str::trim)
-                .filter(|server| !server.is_empty())
-                .collect();
-            let wanted = smolvm_protocol::resolv::render(&servers, options);
+            let wanted = smolvm_protocol::resolv::with_options(current, options);
             (wanted != current).then_some(wanted)
         }
         _ => None,
@@ -232,8 +227,9 @@ fn tsi_resolv_conf(
 }
 
 /// The resolver options the host asked for (`guest_env::DNS_OPTIONS`).
-/// Invalid tokens are dropped and logged, never written.
-fn resolv_options() -> Vec<String> {
+/// Invalid tokens are dropped and logged, never written. Every writer of
+/// resolv.conf takes its options from here.
+pub(crate) fn resolv_options() -> Vec<String> {
     let value = std::env::var(guest_env::DNS_OPTIONS).unwrap_or_default();
     let (accepted, rejected) = smolvm_protocol::resolv::parse_options(&value);
     for reason in rejected {
@@ -8422,6 +8418,16 @@ mod tests {
                 &options
             ),
             None
+        );
+        // A host file's search domains survive; only its options are replaced.
+        assert_eq!(
+            tsi_resolv_conf(
+                None,
+                "search corp.example\nnameserver 10.0.0.2\noptions ndots:5\n",
+                &options
+            )
+            .as_deref(),
+            Some("search corp.example\nnameserver 10.0.0.2\noptions timeout:1 use-vc\n")
         );
     }
 

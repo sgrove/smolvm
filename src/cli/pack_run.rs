@@ -1462,6 +1462,11 @@ struct PackedRunArgs {
     #[arg(long, value_name = "IP")]
     dns: Option<std::net::Ipv4Addr>,
 
+    /// Resolver option for the guest resolv.conf (repeatable, in order); see
+    /// `machine create --dns-option`.
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = crate::cli::machine::parse_dns_option)]
+    dns_option: Vec<String>,
+
     /// Number of vCPUs (overrides default)
     #[arg(long, value_name = "N")]
     cpus: Option<u8>,
@@ -1541,6 +1546,11 @@ struct PackedStartArgs {
     /// host's own resolver; use this when that is not the resolver to use.
     #[arg(long, value_name = "IP")]
     dns: Option<std::net::Ipv4Addr>,
+
+    /// Resolver option for the guest resolv.conf (repeatable, in order); see
+    /// `machine create --dns-option`.
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = crate::cli::machine::parse_dns_option)]
+    dns_option: Vec<String>,
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
@@ -1693,7 +1703,7 @@ fn run_ephemeral(
                 net_backend: args.net_backend,
                 ssh_agent: args.ssh_agent,
                 dns: args.dns,
-                dns_option: Vec::new(),
+                dns_option: args.dns_option.clone(),
                 cpus: args.cpus,
                 mem: args.mem,
                 storage: args.storage,
@@ -1839,7 +1849,7 @@ fn run_from_cache(
         network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
         dns: args.dns,
-        dns_options: Vec::new(),
+        dns_options: args.dns_option.clone(),
         network_name: None,
         guest_subnet: None,
         gpu: manifest.gpu,
@@ -2286,7 +2296,7 @@ fn daemon_start(
         network: args.net || manifest.network || !ports.is_empty(),
         network_backend: args.net_backend,
         dns: args.dns,
-        dns_options: Vec::new(),
+        dns_options: args.dns_option.clone(),
         network_name: None,
         guest_subnet: None,
         gpu: manifest.gpu,

@@ -642,6 +642,8 @@ pub struct RunCmd {
     /// Resolver option for the guest resolv.conf (repeatable, in order), e.g.
     /// `--dns-option timeout:1 --dns-option use-vc`. Written as one `options`
     /// line by every guest writer of resolv.conf (see `resolv.conf(5)`).
+    /// glibc honors every accepted option; musl (Alpine) honors only
+    /// `ndots`, `timeout` and `attempts` and ignores the rest.
     #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option, help_heading = "Network")]
     pub dns_option: Vec<String>,
 
@@ -4036,6 +4038,8 @@ pub struct CreateCmd {
     /// Resolver option for the guest resolv.conf (repeatable, in order), e.g.
     /// `--dns-option timeout:1 --dns-option use-vc`. Written as one `options`
     /// line by every guest writer of resolv.conf (see `resolv.conf(5)`).
+    /// glibc honors every accepted option; musl (Alpine) honors only
+    /// `ndots`, `timeout` and `attempts` and ignores the rest.
     #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option)]
     pub dns_option: Vec<String>,
 

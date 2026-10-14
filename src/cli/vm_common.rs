@@ -3252,6 +3252,14 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     if let Some(cidrs) = &record.allowed_cidrs {
         fields.insert("allowed_cidrs".into(), serde_json::json!(cidrs));
     }
+    // The guest resolver and its options, present only when set (`--dns`,
+    // `--dns-option`), so tooling can see what the guest resolv.conf gets.
+    if let Some(dns) = record.dns {
+        fields.insert("dns".into(), serde_json::json!(dns.to_string()));
+    }
+    if !record.dns_options.is_empty() {
+        fields.insert("dns_options".into(), serde_json::json!(record.dns_options));
+    }
     // A branch keeps its staged working copies but never writes them back;
     // name the machine that does, so tooling can send the user there.
     if let Some(source) = &record.staged_mounts_detached_from {
@@ -4601,5 +4609,29 @@ mod mount_socket_placeholder_tests {
             vec![mount_sock("/run/control/engine.sock")],
         );
         remove_placeholders(&record); // nothing present: no failure
+    }
+}
+
+#[cfg(test)]
+mod status_dns_tests {
+    use super::machine_status_json;
+    use smolvm::config::VmRecord;
+
+    // `--dns` and `--dns-option` show up in status JSON only when set, so the
+    // object other machines produce is unchanged.
+    #[test]
+    fn status_json_reports_resolver_and_options_only_when_set() {
+        let mut record = VmRecord::new("d".to_string(), 1, 512, vec![], vec![], true);
+        let plain = machine_status_json("d", &record);
+        assert!(plain.get("dns").is_none() && plain.get("dns_options").is_none());
+
+        record.dns = Some("9.9.9.9".parse().unwrap());
+        record.dns_options = vec!["timeout:1".into(), "use-vc".into()];
+        let status = machine_status_json("d", &record);
+        assert_eq!(status["dns"], "9.9.9.9");
+        assert_eq!(
+            status["dns_options"],
+            serde_json::json!(["timeout:1", "use-vc"])
+        );
     }
 }

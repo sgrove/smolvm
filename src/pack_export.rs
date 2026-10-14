@@ -1600,6 +1600,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             network: false,
             network_backend: None,
             dns: None,
+            dns_options: Vec::new(),
             gpu: false,
             cuda: false,
             gpu_vram_mib: None,
