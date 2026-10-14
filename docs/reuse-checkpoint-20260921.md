@@ -30,3 +30,28 @@ batch, alias and held forms plus unchanged default. Selection tests cover
 missing checkpoint, changed PID/birth, missing running-source marker,
 foreign path, valid paused/running reuse, and unchanged direct/pool defaults.
 Native compilation and live repeated-fork depth proof remain pending.
+
+## Provenance: the deployed fork CLI is reproducible (verified 2026-10-14)
+
+The fleet's retained fork CLI `5bcd38d1ed7e7e99a7a91cecdf199e4753b97ee027a2d50741db6d7dae3c4082`
+is rebuilt byte-for-byte from 9504e94 plus this patch (commit "machine branch
+--reuse-checkpoint ... (recovered 2026-09-21 fleet patch)") with:
+
+- toolchain: rustc/cargo 1.93.1 (01f6ddf75), ld-1230.1, macOS SDK 26.2;
+- exact paths (absolute source paths are embedded): source at
+  `/Volumes/extssd/shd18/reuse-checkpoint-20260921/smolvm-9504e94e3581a1f52c414247edcbcd6d6b49a71a`
+  (a physical directory: cargo canonicalizes the workspace root),
+  `CARGO_HOME=/Volumes/extssd/shd18/cargo`,
+  `CARGO_TARGET_DIR=/Volumes/extssd/shd18/reuse-checkpoint-20260921/native-target`;
+- `LIBKRUN_DIR` holding the runtime's libkrun `404127e4...` (install ID
+  `libkrun.2.dylib`), `RUSTFLAGS='-C link-arg=-Wl,-rpath,@executable_path/lib
+  -C link-arg=-Wl,-rpath,@executable_path/../lib'`, no `LIBKRUN_BUNDLE`/`_STATIC`/`_BUILD`;
+- `cargo build --release --locked --offline -j 2 -p smolvm --bin smolvm`;
+- utoipa-swagger-ui's rust-embed records each swagger-ui file's mtime and
+  birthtime: the original extraction is 1789997639 for the first twelve files
+  in sorted order (swagger-initializer.js modified 1789997640) and 1789997640
+  for the last six; set them, then recompile that crate;
+- `codesign --force --sign - --entitlements smolvm.entitlements` (gives the
+  intermediate `ed7ac009...`), copy to `tiny-cli-v2/smolvm-bin`,
+  `install_name_tool -change libkrun.2.dylib @rpath/libkrun.dylib`, and the
+  same `codesign` again: `5bcd38d1...`.
