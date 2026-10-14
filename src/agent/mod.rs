@@ -190,6 +190,7 @@ fn gpu_virgl_flags() -> u32 {
 pub(crate) fn guest_network_env(
     guest_network: Option<smolvm_network::GuestNetworkConfig>,
     dns_override: Option<std::net::Ipv4Addr>,
+    dns_options: &[String],
 ) -> Vec<std::ffi::CString> {
     use smolvm_protocol::guest_env;
     let mut env: Vec<std::ffi::CString> = Vec::new();
@@ -218,6 +219,11 @@ pub(crate) fn guest_network_env(
         push(guest_env::DNS, n.dns_server.to_string());
     } else if let Some(dns) = dns_override {
         push(guest_env::DNS, dns.to_string());
+    }
+    // Resolver options (`--dns-option`) apply to whichever resolver the guest
+    // ends up with; the agent renders them into every resolv.conf it writes.
+    if !dns_options.is_empty() {
+        push(guest_env::DNS_OPTIONS, dns_options.join(" "));
     }
     env
 }

@@ -201,14 +201,39 @@ fn boottime_ms() -> u64 {
 /// clobber a valid nameserver the host already wrote. The old code wrote the
 /// hardcoded public resolvers unconditionally, which both dropped `--dns` and
 /// overwrote `setup_dns`'s value, so `--dns` never took effect on TSI.
-fn tsi_resolv_conf(dns_override: Option<&str>, current: &str) -> Option<String> {
+///
+/// `options` (from `--dns-option`) are appended as one `options` line to
+/// whatever this writes; with options set, a host-written file that lacks
+/// them is rewritten so the options always reach the guest's resolver.
+fn tsi_resolv_conf(dns_override: Option<&str>, current: &str, options: &[String]) -> Option<String> {
     match dns_override.map(str::trim) {
-        Some(dns) if !dns.is_empty() => Some(format!("nameserver {dns}\n")),
-        _ if current.contains("127.0.0.1") || current.trim().is_empty() => {
-            Some("nameserver 1.1.1.1\nnameserver 8.8.8.8\n".to_string())
+        Some(dns) if !dns.is_empty() => Some(smolvm_protocol::resolv::render(&[dns], options)),
+        _ if current.contains("127.0.0.1") || current.trim().is_empty() => Some(
+            smolvm_protocol::resolv::render(&smolvm_protocol::resolv::DEFAULT_NAMESERVERS, options),
+        ),
+        _ if !options.is_empty() => {
+            let servers: Vec<&str> = current
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("nameserver"))
+                .map(str::trim)
+                .filter(|server| !server.is_empty())
+                .collect();
+            let wanted = smolvm_protocol::resolv::render(&servers, options);
+            (wanted != current).then_some(wanted)
         }
         _ => None,
     }
+}
+
+/// The resolver options the host asked for (`guest_env::DNS_OPTIONS`).
+/// Invalid tokens are dropped and logged, never written.
+fn resolv_options() -> Vec<String> {
+    let value = std::env::var(guest_env::DNS_OPTIONS).unwrap_or_default();
+    let (accepted, rejected) = smolvm_protocol::resolv::parse_options(&value);
+    for reason in rejected {
+        warn!(%reason, "ignoring resolver option");
+    }
+    accepted
 }
 
 /// Seed the guest wall clock from `SMOLVM_HOST_TIME_NS` (the host's launch time),
@@ -420,7 +445,7 @@ fn main() {
             if !dns_proxy::is_enabled() {
                 let dns_override = std::env::var(guest_env::DNS).ok();
                 let current = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-                if let Some(new) = tsi_resolv_conf(dns_override.as_deref(), &current) {
+                if let Some(new) = tsi_resolv_conf(dns_override.as_deref(), &current, &resolv_options()) {
                     let _ = std::fs::write("/etc/resolv.conf", new);
                 }
             }
@@ -7484,12 +7509,12 @@ mod tests {
     #[test]
     fn tsi_resolv_conf_override_wins_over_current() {
         assert_eq!(
-            tsi_resolv_conf(Some("9.9.9.9"), "nameserver 8.8.8.8\n").as_deref(),
+            tsi_resolv_conf(Some("9.9.9.9"), "nameserver 8.8.8.8\n", &[]).as_deref(),
             Some("nameserver 9.9.9.9\n")
         );
         // Surrounding whitespace is trimmed rather than written into resolv.conf.
         assert_eq!(
-            tsi_resolv_conf(Some(" 10.0.0.2 "), "").as_deref(),
+            tsi_resolv_conf(Some(" 10.0.0.2 "), "", &[]).as_deref(),
             Some("nameserver 10.0.0.2\n")
         );
     }
@@ -7499,9 +7524,30 @@ mod tests {
     // half of the same bug.
     #[test]
     fn tsi_resolv_conf_preserves_valid_host_written_file() {
-        assert_eq!(tsi_resolv_conf(None, "nameserver 9.9.9.9\n"), None);
+        assert_eq!(tsi_resolv_conf(None, "nameserver 9.9.9.9\n", &[]), None);
         // A blank override is treated as "no override", so preservation applies.
-        assert_eq!(tsi_resolv_conf(Some("  "), "nameserver 10.0.0.2\n"), None);
+        assert_eq!(tsi_resolv_conf(Some("  "), "nameserver 10.0.0.2\n", &[]), None);
+    }
+
+    #[test]
+    fn tsi_resolv_conf_appends_resolver_options_on_every_path() {
+        let options = vec!["timeout:1".to_string(), "use-vc".to_string()];
+        assert_eq!(
+            tsi_resolv_conf(Some("9.9.9.9"), "", &options).as_deref(),
+            Some("nameserver 9.9.9.9\noptions timeout:1 use-vc\n")
+        );
+        assert_eq!(
+            tsi_resolv_conf(None, "", &options).as_deref(),
+            Some("nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:1 use-vc\n")
+        );
+        assert_eq!(
+            tsi_resolv_conf(None, "nameserver 10.0.0.2\nnameserver 10.0.0.3\n", &options).as_deref(),
+            Some("nameserver 10.0.0.2\nnameserver 10.0.0.3\noptions timeout:1 use-vc\n")
+        );
+        assert_eq!(
+            tsi_resolv_conf(None, "nameserver 10.0.0.2\noptions timeout:1 use-vc\n", &options),
+            None
+        );
     }
 
     // A stale loopback (left by a prior --allow-host run) or an empty file is
@@ -7510,11 +7556,11 @@ mod tests {
     fn tsi_resolv_conf_repairs_stale_loopback_or_empty() {
         let public = "nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
         assert_eq!(
-            tsi_resolv_conf(None, "nameserver 127.0.0.1\n").as_deref(),
+            tsi_resolv_conf(None, "nameserver 127.0.0.1\n", &[]).as_deref(),
             Some(public)
         );
-        assert_eq!(tsi_resolv_conf(None, "").as_deref(), Some(public));
-        assert_eq!(tsi_resolv_conf(None, "   \n").as_deref(), Some(public));
+        assert_eq!(tsi_resolv_conf(None, "", &[]).as_deref(), Some(public));
+        assert_eq!(tsi_resolv_conf(None, "   \n", &[]).as_deref(), Some(public));
     }
 
     #[test]

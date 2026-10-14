@@ -498,6 +498,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Resolver options for the guest resolv.conf (`--dns-option`), in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_options: Vec<String>,
+
     /// Named inter-VM network this machine joins on start (virtio-net only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
@@ -736,6 +740,7 @@ impl VmRecord {
             allowed_cidrs: None,
             network_backend: None,
             dns: None,
+            dns_options: Vec::new(),
             network_name: None,
             image: None,
             entrypoint: Vec::new(),
@@ -809,6 +814,7 @@ impl VmRecord {
             allowed_cidrs: None,
             network_backend: None,
             dns: None,
+            dns_options: Vec::new(),
             network_name: None,
             image: None,
             entrypoint: Vec::new(),
@@ -1024,6 +1030,7 @@ impl VmRecord {
             block_io: self.block_io,
             allowed_cidrs: self.allowed_cidrs.clone(),
             dns: self.dns,
+            dns_options: self.dns_options.clone(),
             network_name: self.network_name.clone(),
         }
     }

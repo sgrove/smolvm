@@ -577,6 +577,12 @@ pub struct RunCmd {
     #[arg(long, value_name = "IP", help_heading = "Network")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Resolver option for the guest resolv.conf (repeatable, in order), e.g.
+    /// `--dns-option timeout:1 --dns-option use-vc`. Written as one `options`
+    /// line by every guest writer of resolv.conf (see `resolv.conf(5)`).
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option, help_heading = "Network")]
+    pub dns_option: Vec<String>,
+
     /// Join a named inter-VM network (implies --net, virtio-net only): members
     /// get distinct addresses and can reach each other directly
     #[arg(long = "network", value_name = "NAME", help_heading = "Network")]
@@ -1024,6 +1030,10 @@ fn ensure_init_layer(
         if let Some(dns) = params.dns {
             create.push("--dns".into());
             create.push(dns.to_string());
+        }
+        for option in &params.dns_options {
+            create.push("--dns-option".into());
+            create.push(option.clone());
         }
         for c in params.allowed_cidrs.iter().flatten() {
             create.push("--allow-cidr".into());
@@ -1565,6 +1575,7 @@ impl RunCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
@@ -3279,6 +3290,12 @@ pub struct CreateCmd {
     #[arg(long, value_name = "IP")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Resolver option for the guest resolv.conf (repeatable, in order), e.g.
+    /// `--dns-option timeout:1 --dns-option use-vc`. Written as one `options`
+    /// line by every guest writer of resolv.conf (see `resolv.conf(5)`).
+    #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option)]
+    pub dns_option: Vec<String>,
+
     /// Join a named inter-VM network (implies --net, virtio-net only): members
     /// get distinct addresses and can reach each other directly
     #[arg(long = "network", value_name = "NAME")]
@@ -3525,6 +3542,7 @@ impl CreateCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             gpu: params.gpu,
             nested_virt: params.nested_virt,
@@ -3786,6 +3804,7 @@ impl CreateCmd {
             net: network,
             network_backend: checkpoint_backend.or(self.net_backend),
             dns: self.dns,
+            dns_options: self.dns_option.clone(),
             network_name: self.network_name.clone(),
             init: self.init.clone(),
             env: {
@@ -3861,6 +3880,7 @@ impl CreateCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             gpu: params.gpu,
             nested_virt: params.nested_virt,
@@ -5894,4 +5914,10 @@ impl MonitorCmd {
         );
         Ok(())
     }
+}
+
+/// clap value parser for `--dns-option`: the same validation the guest agent
+/// applies, so an option the agent would drop is refused at the command line.
+fn parse_dns_option(value: &str) -> Result<String, String> {
+    smolvm_protocol::resolv::validate_option(value).map(|()| value.to_string())
 }

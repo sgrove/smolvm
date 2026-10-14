@@ -54,6 +54,7 @@ pub mod forkpoint;
 pub mod guest_env;
 pub mod image_ref;
 pub mod publish_socket;
+pub mod resolv;
 pub mod retry;
 pub mod secrets;
 

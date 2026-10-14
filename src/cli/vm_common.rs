@@ -469,6 +469,7 @@ pub struct CreateVmParams {
     pub net: bool,
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
+    pub dns_options: Vec<String>,
     pub network_name: Option<String>,
     pub init: Vec<String>,
     pub env: Vec<String>,
@@ -724,6 +725,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
     record.dns = params.dns;
+    record.dns_options = params.dns_options.clone();
     record.network_name = params.network_name.clone();
     record.gpu = if params.gpu { Some(true) } else { None };
     // Persist nesting the same way: `machine start` rebuilds resources from the
@@ -1908,6 +1910,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.network = o.network;
     r.network_backend = o.network_backend;
     r.dns = o.dns;
+    r.dns_options = o.dns_options.clone();
     r.network_name = o.network_name.clone();
     r.storage_gb = o.storage_gb;
     r.overlay_gb = o.overlay_gb;
@@ -1978,6 +1981,7 @@ pub struct DefaultVmOverrides {
     pub network: bool,
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
+    pub dns_options: Vec<String>,
     pub network_name: Option<String>,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
@@ -2024,6 +2028,7 @@ impl DefaultVmOverrides {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             storage_gb: params.storage_gb,
             overlay_gb: params.overlay_gb,

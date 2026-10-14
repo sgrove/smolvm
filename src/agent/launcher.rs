@@ -2084,6 +2084,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         env_strings.extend(crate::agent::guest_network_env(
             guest_network,
             resources.dns,
+            &resources.dns_options,
         ));
 
         // Tell the agent about pre-extracted packed layers
