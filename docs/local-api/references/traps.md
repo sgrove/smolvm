@@ -91,10 +91,17 @@ moves it, to a loopback address only). It has no authentication and answers only
 
 ## Local image archives can be OCI layouts
 
-`POST /api/v1/machines` accepts a server-local `image` path to a `docker save` archive or an OCI
-layout tar (optionally gzipped). For an OCI archive without Docker's `manifest.json`, the guest
-streams a small compatibility manifest into its image flattener; the input archive is unchanged.
-Choose an archive containing a Linux image for the guest's architecture.
+`POST /api/v1/machines` accepts a server-local `image` path to a `docker save` archive, an OCI
+layout tar (optionally gzipped) or an unpacked rootfs directory. For an OCI archive without Docker's
+`manifest.json`, the guest streams a small compatibility manifest into its image flattener; the
+input archive is unchanged. Choose an archive containing a Linux image for the guest's architecture.
+
+**From v1.27.1 the server takes a local path only under `serve start --local-image-dir <DIR>`.**
+Measured on macOS arm64 on v1.27.3, each a `400`: without the flag a create naming a path answers
+``local images are disabled on this server; start `smolvm serve` with --local-image-dir ...``; with
+it, a path that does not resolve inside the directory, symlinks followed, answers `local image
+'<path>' is outside this server's local image directory`; and `"image":"-"` answers `image '-'
+requires CLI stdin`, with or without the flag.
 
 ## Only one server per host, unless you move its rollout port
 

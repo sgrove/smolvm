@@ -37,6 +37,113 @@ workload runs as), `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`,
 `stop_on_exit` (stop the machine when its workload exits), and the
 `[network]`, `[dev]`, `[auth]`, `[health]`, `[restart]`, `[service]` tables.
 
+## Reference
+
+```toml
+# Workload
+image = "python:3.12-alpine"          # OCI image (omit for bare Alpine)
+entrypoint = ["/app/run"]             # executable and fixed leading arguments (overrides image ENTRYPOINT)
+cmd = ["serve"]                       # default arguments appended to entrypoint (overrides image CMD)
+env = ["PORT=8080", "DEBUG=1"]        # environment variables
+workdir = "/app"                      # working directory
+user = "app"                          # who the workload runs as: a passwd name or uid[:gid]
+stop_on_exit = true                   # stop the machine when the workload exits (default: false)
+
+# Resources
+cpus = 2                              # vCPUs (default: 4)
+memory = 1024                         # MiB (default: 8192, elastic via balloon)
+net = true                            # outbound networking (default: false)
+gpu = true                            # GPU acceleration, Vulkan via virtio-gpu (default: false)
+gpu_vram = 4096                       # GPU shared-memory region in MiB (default: 4096, ignored unless gpu = true)
+storage = 40                          # storage disk GiB (default: 20)
+overlay = 4                           # overlay disk GiB (default: 10)
+
+# Mounts, ports and provisioning ([dev] lists below replace these when set)
+volumes = ["./src:/app"]              # host bind mounts
+ports = ["8080:8080", "27015:27015/udp"]  # host:guest forwarding; /udp for UDP
+init = ["pip install -r requirements.txt"]  # run once, on the machine's first start
+
+# Network policy: egress filtering by hostname and/or CIDR
+[network]
+allow_hosts = ["api.stripe.com"]      # resolved at VM start; the host and its subdomains (implies net)
+allow_host_patterns = ["api.example.com", "*.files.example.com"]  # exact name, or subdomains only
+allow_cidrs = ["10.0.0.0/8"]          # IP/CIDR ranges (implies net)
+
+# Dev profile (used by `machine run` and `machine create`)
+[dev]
+volumes = ["./src:/app"]              # replaces the top-level list when set
+ports = ["8080:8080"]                 # replaces the top-level list when set
+init = ["npm install"]                # replaces the top-level list when set
+env = ["APP_MODE=dev"]                # extends the top-level env
+workdir = "/app"                      # overrides the top-level workdir
+user = "app"                          # overrides the top-level user
+
+# Artifact profile (used by `pack create`; `[pack]` is the same table)
+[artifact]
+cpus = 4                              # override resources for distribution
+memory = 2048
+entrypoint = ["/app/run"]             # override entrypoint for the packed binary
+cmd = ["serve"]                       # override cmd for the packed binary
+oci_platform = "linux/amd64"          # target OCI platform
+
+# Health check (used by `machine monitor`)
+[health]
+exec = ["curl", "-f", "http://127.0.0.1:8080/health"]
+interval = "10s"
+timeout = "2s"
+retries = 3
+startup_grace = "20s"
+
+# Restart policy: never (default), always, on-failure or unless-stopped
+[restart]
+policy = "always"
+max_retries = 5
+max_backoff = "60s"
+
+# SSH agent forwarding
+[auth]
+ssh_agent = true                      # forward the host SSH agent into the VM
+
+# Secrets: references to host sources, resolved at workload launch
+[secrets]
+DATABASE_URL = { from_env  = "PROD_DB_URL" }      # host env var (at launch)
+GCP_CREDS    = { from_file = "/abs/creds.json" }  # absolute host file (at launch)
+```
+
+Credential bindings are `[[network.credentials]]` tables, described in
+[credential substitution](credential-substitution.md). The other accepted keys
+are `net_backend`, `rosetta`, `cuda`, `auto_graph`, `docker_socket`,
+`block_io`, `disk_durability` and the `[branch]` (or `[fork]`) and `[service]`
+tables; `machine create --help` describes the flag each one mirrors.
+
+## Merge precedence
+
+CLI flags override Smolfile values. For `machine run` and `machine create`:
+
+```
+image:      --image flag > Smolfile image > None (bare Alpine)
+entrypoint: Smolfile entrypoint > image metadata
+cmd:        trailing args (after --) > Smolfile cmd > image metadata
+env:        top-level env + [dev].env + CLI -e (all merged)
+volumes:    [dev].volumes, else top-level volumes, then + CLI -v
+ports:      [dev].ports, else top-level ports, then + CLI -p
+init:       [dev].init, else top-level init, then + CLI --init
+workdir:    CLI -w > [dev].workdir > top-level workdir
+cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
+```
+
+For `pack create`:
+
+```
+image:        --image flag > Smolfile image
+entrypoint:   --entrypoint flag > [artifact].entrypoint > Smolfile entrypoint > image metadata
+cmd:          [artifact].cmd > Smolfile cmd > image metadata
+cpus/memory:  --cpus / --mem > [artifact] > Smolfile > defaults
+oci_platform: --oci-platform > [artifact].oci_platform
+env:          image env + Smolfile top-level env (a Smolfile key replaces the image's)
+workdir:      Smolfile workdir > image workdir
+```
+
 ### Stopping when the workload exits
 
 By default a machine keeps running after its workload exits. With

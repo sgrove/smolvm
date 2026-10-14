@@ -668,7 +668,7 @@ pub(crate) fn retained_snapshot_source_continues(snapshot: &RetainedForkSnapshot
     snapshot.path.join("source-continues-v1").is_file()
 }
 
-fn restart_blocking_dependent_clones_in(
+pub(super) fn restart_blocking_dependent_clones_in(
     db: &SmolvmDb,
     golden: &str,
     snapshot_root: &Path,
@@ -2043,6 +2043,27 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
     }
 }
 
+/// Join the guest's scattered free pages into the large blocks free page
+/// hinting can hand over. Best effort: an older agent or a kernel without
+/// compaction just leaves memory as it is.
+pub fn compact_guest_memory(name: &str) {
+    let socket = vm_data_dir(name).join("agent.sock");
+    let Ok(mut client) = AgentClient::connect_with_retry(&socket) else {
+        return;
+    };
+    let _ = client.vm_exec(
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo 1 > /proc/sys/vm/compact_memory".to_string(),
+        ],
+        Vec::new(),
+        None,
+        Some(SYNC_FORK_SOURCE_TIMEOUT),
+        None,
+    );
+}
+
 /// Release the workload restored in `clone` after its identity and per-fork
 /// environment are installed. The state directory is private guest RAM, so a
 /// release marker wakes only this clone even though every clone inherited the
@@ -2149,6 +2170,8 @@ pub struct PreparedFork {
     /// caller to log. Empty when the golden has no forwards. When ports were
     /// pinned, `golden_host == clone_host`.
     pub port_remaps: Vec<(u16, u16, u16)>,
+    /// The same for UDP forwards, which are always remapped.
+    pub udp_port_remaps: Vec<(u16, u16, u16)>,
     /// Whether the source resumed after this checkpoint.
     pub source_continues: bool,
 }
@@ -2310,7 +2333,7 @@ pub(crate) fn prepare_forks_reusing(
     }
 
     let mut names = HashSet::with_capacity(specs.len());
-    let mut reserved_ports = HashSet::new();
+    let mut reserved_ports = ReservedPorts::default();
     for spec in specs {
         validate_vm_name(spec.clone, "clone name").map_err(|e| Error::config("clone name", e))?;
         validate_fork_env(spec.fork_env)?;
@@ -2333,7 +2356,7 @@ pub(crate) fn prepare_forks_reusing(
             ));
         }
         for (host, _) in spec.pinned_ports {
-            if !reserved_ports.insert(*host) {
+            if !reserved_ports.tcp.insert(*host) {
                 return Err(Error::config(
                     "fork",
                     format!("host port {host} is assigned to more than one clone"),
@@ -2351,7 +2374,13 @@ pub(crate) fn prepare_forks_reusing(
     let recorded = db.list_vms()?;
     reserve_recorded_host_ports(
         recorded.iter().map(|(_, record)| record.ports.as_slice()),
-        &mut reserved_ports,
+        &mut reserved_ports.tcp,
+    );
+    reserve_recorded_host_ports(
+        recorded
+            .iter()
+            .map(|(_, record)| record.udp_ports.as_slice()),
+        &mut reserved_ports.udp,
     );
 
     let golden_rec = db
@@ -2898,7 +2927,7 @@ fn prepare_clone_from_snapshot(
     golden_dir: &Path,
     snapshot_dir: &Path,
     spec: &ForkSpec<'_>,
-    reserved_ports: &mut HashSet<u16>,
+    reserved_ports: &mut ReservedPorts,
 ) -> Result<PreparedFork> {
     let clone = spec.clone;
     let clone_dir = vm_data_dir(clone);
@@ -2963,7 +2992,7 @@ fn prepare_clone_from_snapshot(
         } else if !clone_rec.ports.is_empty() {
             let mut remapped = Vec::with_capacity(clone_rec.ports.len());
             for (golden_host, guest) in &clone_rec.ports {
-                match alloc_free_host_port_excluding(reserved_ports) {
+                match alloc_free_host_port_excluding(&mut reserved_ports.tcp) {
                     Some(host) => {
                         port_remaps.push((*golden_host, *guest, host));
                         remapped.push((host, *guest));
@@ -2975,6 +3004,25 @@ fn prepare_clone_from_snapshot(
                 }
             }
             clone_rec.ports = remapped;
+        }
+        // The source keeps its UDP host ports, so a child always gets fresh ones
+        // (branch pins name TCP ports only).
+        let mut udp_port_remaps = Vec::new();
+        if !clone_rec.udp_ports.is_empty() {
+            let mut remapped = Vec::with_capacity(clone_rec.udp_ports.len());
+            for (golden_host, guest) in &clone_rec.udp_ports {
+                match alloc_free_udp_host_port_excluding(&mut reserved_ports.udp) {
+                    Some(host) => {
+                        udp_port_remaps.push((*golden_host, *guest, host));
+                        remapped.push((host, *guest));
+                    }
+                    None => tracing::warn!(
+                        guest,
+                        "could not allocate a host UDP port for fork clone; dropping forward"
+                    ),
+                }
+            }
+            clone_rec.udp_ports = remapped;
         }
         clone_rec.fork_overlay_owner = Some(
             golden_rec
@@ -3008,6 +3056,7 @@ fn prepare_clone_from_snapshot(
             snapshot_dir: snapshot_dir.to_path_buf(),
             clone_record: clone_rec,
             port_remaps,
+            udp_port_remaps,
             source_continues: fork_continue_snapshot(snapshot_dir),
         })
     })();
@@ -3989,17 +4038,32 @@ const CLONE_PORT_CEILING: u16 = 32_000;
 /// already in use". Allocating below the ephemeral range instead means only
 /// another deliberate bind can collide, which the free check below catches.
 fn alloc_free_host_port() -> Option<u16> {
+    alloc_free_port_where(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+}
+
+fn alloc_free_udp_host_port() -> Option<u16> {
+    alloc_free_port_where(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok())
+}
+
+fn alloc_free_port_where(free: impl Fn(u16) -> bool) -> Option<u16> {
     let span = u32::from(CLONE_PORT_CEILING - CLONE_PORT_FLOOR);
     for _ in 0..256 {
         let offset = host_random_u16()? % span as u16;
         let port = CLONE_PORT_FLOOR + offset;
         // Binding confirms the port is free; dropping it immediately is safe
         // here because nothing else will be *assigned* this number.
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if free(port) {
             return Some(port);
         }
     }
     None
+}
+
+/// Host ports a batch of branches must not hand out, TCP and UDP apart.
+#[derive(Default)]
+struct ReservedPorts {
+    tcp: HashSet<u16>,
+    udp: HashSet<u16>,
 }
 
 /// Two random bytes from the host RNG, for choosing a clone's host port.
@@ -4057,6 +4121,16 @@ fn reserve_recorded_host_ports<'a>(
 fn alloc_free_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
     for _ in 0..128 {
         let port = alloc_free_host_port()?;
+        if reserved.insert(port) {
+            return Some(port);
+        }
+    }
+    None
+}
+
+fn alloc_free_udp_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
+    for _ in 0..128 {
+        let port = alloc_free_udp_host_port()?;
         if reserved.insert(port) {
             return Some(port);
         }

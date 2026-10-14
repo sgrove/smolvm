@@ -715,8 +715,8 @@ pub(crate) fn build_vm_record_for(
         }
     }
 
-    // Convert port mappings to tuple format for storage
-    let ports = PortMapping::to_tuples(&params.port);
+    // Convert port mappings to tuple format for storage, TCP and UDP apart.
+    let (ports, udp_ports) = PortMapping::split_tuples(&params.port);
 
     // Parse environment variables for init
     let env = smolvm::util::parse_env_list(&params.env);
@@ -775,6 +775,7 @@ pub(crate) fn build_vm_record_for(
         params.net,
         restart,
     );
+    record.udp_ports = udp_ports;
     record.staged_mounts = staged_mounts;
     record.init = params.init.clone();
     record.remote_volumes = remote_volumes;
@@ -1002,6 +1003,11 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
         } else {
             eprintln!("  port {clone_host}->{guest} (pinned)");
         }
+    }
+    for (golden_host, guest, clone_host) in &prep.udp_port_remaps {
+        eprintln!(
+            "  port {golden_host}->{guest}/udp (source) remapped to {clone_host}->{guest}/udp (child)"
+        );
     }
 
     let prep_source_continues = prep.source_continues;
@@ -1695,13 +1701,13 @@ fn start_vm_named_with_db(
             cli_recover_if_unreachable(name)?;
         }
         RecordState::Frozen => {
-            let clones = db.dependent_clones(name).unwrap_or_default();
+            let clones = smolvm::agent::fork::restart_blocking_dependent_clones(db, name)?;
             let reason = if clones.is_empty() {
                 "it retains a reusable fork checkpoint; stop it before restarting, or fork it again"
                     .to_string()
             } else {
                 format!(
-                    "it is the branch source for {} live child machine(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the children first",
+                    "it is the branch source for {} dependent child machine(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the children first",
                     clones.len(),
                     clones.join(", ")
                 )
@@ -2133,7 +2139,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.mem = o.mem;
     r.mounts = o.mounts.clone();
     r.staged_mounts = o.staged_mounts.clone();
-    r.ports = o.ports.clone();
+    r.set_port_mappings(&o.ports);
     r.network = o.network;
     r.network_backend = o.network_backend;
     r.dns = o.dns;
@@ -2210,7 +2216,7 @@ pub struct DefaultVmOverrides {
     pub mem: u32,
     pub mounts: Vec<(String, String, bool)>,
     pub staged_mounts: Vec<(usize, String, String)>,
-    pub ports: Vec<(u16, u16)>,
+    pub ports: Vec<PortMapping>,
     pub network: bool,
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
@@ -2258,7 +2264,7 @@ impl DefaultVmOverrides {
         params: &CreateVmParams,
         mounts: Vec<(String, String, bool)>,
         staged_mounts: Vec<(usize, String, String)>,
-        ports: Vec<(u16, u16)>,
+        ports: Vec<PortMapping>,
     ) -> Self {
         Self {
             secret_refs: params.secret_refs.clone(),
@@ -2310,7 +2316,8 @@ fn check_port_conflicts(
     ports: &[PortMapping],
     db: &SmolvmDb,
 ) -> smolvm::Result<()> {
-    let host_ports: std::collections::HashSet<u16> = ports.iter().map(|p| p.host).collect();
+    let host_ports: std::collections::HashSet<_> =
+        ports.iter().map(|p| (p.host, p.protocol)).collect();
     if host_ports.is_empty() {
         return Ok(());
     }
@@ -2324,13 +2331,18 @@ fn check_port_conflicts(
         if record.actual_state() != smolvm::config::RecordState::Running {
             continue;
         }
-        for (host, _guest) in &record.ports {
-            if host_ports.contains(host) {
+        for mapping in record.port_mappings() {
+            if host_ports.contains(&(mapping.host, mapping.protocol)) {
                 return Err(smolvm::Error::config(
                     "start machine",
                     format!(
-                        "host port {} is already in use by running machine '{}'",
-                        host, name
+                        "host port {}{} is already in use by running machine '{}'",
+                        mapping.host,
+                        match mapping.protocol {
+                            smolvm::data::network::PortProtocol::Udp => "/udp",
+                            smolvm::data::network::PortProtocol::Tcp => "",
+                        },
+                        name
                     ),
                 ));
             }
@@ -2490,15 +2502,16 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
             // fall through to the normal stop path
         }
         RecordState::Frozen => {
-            let clones = SmolvmDb::open()?.dependent_clones(name).unwrap_or_default();
+            let clones =
+                smolvm::agent::fork::restart_blocking_dependent_clones(&SmolvmDb::open()?, name)?;
             if !clones.is_empty() {
                 // A snapshot-frozen fork base must outlive its clones: their
                 // disks CoW-back onto its disks and their RAM maps its memfd.
                 return Err(smolvm::Error::agent(
                     "stop",
                     format!(
-                        "machine '{name}' is the fork base for {} live clone(s) ({}); \
-                         stop or delete the clones first",
+                        "machine '{name}' is the fork base for {} dependent clone(s) ({}); \
+                         delete those clones first",
                         clones.len(),
                         clones.join(", ")
                     ),
@@ -3194,7 +3207,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "memory_mib": record.mem,
         "pid": record.pid,
         "mounts": record.mounts.len() + record.staged_mounts.len(),
-        "ports": record.ports.len(),
+        "ports": record.ports.len() + record.udp_ports.len(),
         "created_at": record.created_at,
         "storage_gb": record.storage_gb,
         "overlay_gb": record.overlay_gb,
@@ -3387,7 +3400,7 @@ pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
                 record.cpus,
                 format!("{} MiB", record.mem),
                 record.mounts.len() + record.staged_mounts.len(),
-                record.ports.len(),
+                record.ports.len() + record.udp_ports.len(),
                 format!("{} GiB", storage_gb),
                 format!("{} GiB", overlay_gb),
                 branched_from,
@@ -3401,8 +3414,12 @@ pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
                     let ro_str = if *ro { " (ro)" } else { "" };
                     println!("  Mount: {} -> {}{}", host, guest, ro_str);
                 }
-                for (host, guest) in &record.ports {
-                    println!("  Port: {} -> {}", host, guest);
+                for mapping in record.port_mappings() {
+                    let udp = match mapping.protocol {
+                        smolvm::data::network::PortProtocol::Udp => "/udp",
+                        smolvm::data::network::PortProtocol::Tcp => "",
+                    };
+                    println!("  Port: {} -> {}{udp}", mapping.host, mapping.guest);
                 }
                 if record.network {
                     println!("  Network: enabled");

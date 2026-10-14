@@ -97,14 +97,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
                 staged: mount.staged,
             })
             .collect(),
-        ports: record
-            .ports
-            .iter()
-            .map(|(host, guest)| PortSpec {
-                host: *host,
-                guest: *guest,
-            })
-            .collect(),
+        ports: record.port_mappings().iter().map(PortSpec::from).collect(),
         network: record.network,
         gpu: record.gpu.unwrap_or(false),
         cuda: record.cuda,
@@ -2080,14 +2073,7 @@ pub async fn restore_portable_checkpoint(
 /// so the two branches don't drift.
 fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> MachineEntry {
     let mounts = record.host_mounts().iter().map(MountSpec::from).collect();
-    let ports = record
-        .ports
-        .iter()
-        .map(|(h, g)| PortSpec {
-            host: *h,
-            guest: *g,
-        })
-        .collect();
+    let ports = record.port_mappings().iter().map(PortSpec::from).collect();
     MachineEntry {
         manager,
         cache_disk: record.cache_disk.clone(),
@@ -2517,11 +2503,7 @@ async fn create_machine_inner(
             ));
         }
     }
-    let port_mappings: Vec<PortMapping> = req
-        .ports
-        .iter()
-        .map(|p| PortMapping::new(p.host, p.guest))
-        .collect();
+    let port_mappings: Vec<PortMapping> = req.ports.iter().map(PortMapping::from).collect();
     PortMapping::check_duplicates(&port_mappings).map_err(ApiError::BadRequest)?;
 
     // Validate and normalize egress CIDRs, matching the CLI's --allow-cidr
@@ -2751,6 +2733,7 @@ async fn create_machine_inner(
                 .map(|port| PortSpec {
                     host: port.host,
                     guest: port.guest,
+                    protocol: Default::default(),
                 })
                 .collect()
         })
@@ -3515,7 +3498,9 @@ pub async fn get_machine_mediation_events(
 /// scoped to the virtio-net path so an unrelated AddrInUse can't be mistaken for
 /// it.
 fn classify_launch_error(e: String) -> ApiError {
-    if crate::api::error::is_invalid_image_archive(&e) {
+    if crate::api::error::is_invalid_image_archive(&e)
+        || crate::api::error::is_refused_remote_volume(&e)
+    {
         return ApiError::BadRequest(e);
     }
     let lc = e.to_ascii_lowercase();
@@ -3701,16 +3686,18 @@ pub async fn start_machine(
     if resolved == RecordState::Frozen {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {e}")))?
-            .map_err(ApiError::database)?;
+        let clones = tokio::task::spawn_blocking(move || {
+            crate::agent::fork::restart_blocking_dependent_clones(&db, &golden)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+        .map_err(ApiError::database)?;
         let reason = if clones.is_empty() {
             "it retains a reusable fork checkpoint; stop it before restarting, or fork it again"
                 .to_string()
         } else {
             format!(
-                "it is the fork base for {} live clone(s) ({}); delete the clones first",
+                "it is the fork base for {} dependent clone(s) ({}); delete the clones first",
                 clones.len(),
                 clones.join(", ")
             )
@@ -4468,6 +4455,18 @@ async fn prepare_and_boot_branches(
     Ok(())
 }
 
+/// A branch request's pinned ports as `(host, guest)`. Pins name TCP ports: a
+/// branch gets fresh host ports for its source's UDP forwards on its own.
+fn branch_pins(ports: &[PortSpec]) -> Result<Vec<(u16, u16)>, ApiError> {
+    if let Some(udp) = ports.iter().find(|p| !p.protocol.is_tcp()) {
+        return Err(ApiError::BadRequest(format!(
+            "{}:{}/udp cannot be pinned: a branch pins TCP ports, and gets fresh host ports for UDP forwards automatically",
+            udp.host, udp.guest
+        )));
+    }
+    Ok(ports.iter().map(|p| (p.host, p.guest)).collect())
+}
+
 /// The checks a single branch makes before preparing its child. Returns the
 /// child's parsed environment. `names` collects the batch's child names.
 /// Validate a branch's pinned ports as the create path does: a branch uses
@@ -4497,7 +4496,7 @@ async fn check_queued_branch(
     names: &mut std::collections::HashSet<String>,
     host_ports: &mut std::collections::HashSet<u16>,
 ) -> Result<Vec<(String, String)>, ApiError> {
-    let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
+    let pinned_ports = branch_pins(&req.ports)?;
     validate_pinned_ports(&pinned_ports)?;
     if let Some((host, _)) = pinned_ports
         .iter()
@@ -4547,7 +4546,7 @@ async fn fork_machine_transaction(
     reply: &tokio::sync::oneshot::Sender<Result<MachineInfo, ApiError>>,
 ) -> Result<MachineInfo, ApiError> {
     let clone = req.name.clone();
-    let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
+    let pinned_ports = branch_pins(&req.ports)?;
     let req_share_weights = req.share_weights;
     let req_forkable = req.forkable;
     let req_hold = req.hold;
@@ -5392,14 +5391,16 @@ pub async fn stop_machine(
     if resolved == RecordState::Frozen {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-            .map_err(ApiError::database)?;
+        let clones = tokio::task::spawn_blocking(move || {
+            crate::agent::fork::restart_blocking_dependent_clones(&db, &golden)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        .map_err(ApiError::database)?;
         if !clones.is_empty() {
             return Err(ApiError::Conflict(format!(
-                "machine '{}' is the fork base of {} live clone(s) ({}); they CoW-map its \
-                 memory and disks — stop or delete the clones first",
+                "machine '{}' is the fork base of {} dependent clone(s) ({}); they CoW-map its \
+                 memory and disks — delete those clones first",
                 name,
                 clones.len(),
                 clones.join(", ")
@@ -7197,20 +7198,24 @@ mod tests {
             PortSpec {
                 host: 30001,
                 guest: 8080,
+                protocol: Default::default(),
             },
             PortSpec {
                 host: 30002,
                 guest: 3000,
+                protocol: Default::default(),
             },
         ];
         let requested = vec![
             PortSpec {
                 host: 31002,
                 guest: 3000,
+                protocol: Default::default(),
             },
             PortSpec {
                 host: 31001,
                 guest: 8080,
+                protocol: Default::default(),
             },
         ];
         let ports = checkpoint_host_ports(&captured, &requested).unwrap();
@@ -7225,7 +7230,8 @@ mod tests {
             &captured,
             &[PortSpec {
                 host: 31001,
-                guest: 9090
+                guest: 9090,
+                protocol: Default::default(),
             }]
         )
         .is_err());
