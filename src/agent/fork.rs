@@ -1999,6 +1999,26 @@ pub fn prepare_forks(
     Ok(prepare_forks_reusing(db, golden, specs, retained.as_ref(), true, false)?.forks)
 }
 
+/// Branch only the retained generation of this exact live source process.
+/// Missing or stale checkpoints refuse; this operation never captures anew.
+/// Intent: docs/reuse-checkpoint-20260921.md.
+pub fn prepare_forks_from_checkpoint(
+    db: &SmolvmDb,
+    golden: &str,
+    specs: &[ForkSpec<'_>],
+) -> Result<Vec<PreparedFork>> {
+    let retained = db
+        .retained_fork_snapshot(golden)
+        .map_err(|error| Error::agent("read retained fork checkpoint", error.to_string()))?
+        .ok_or_else(|| {
+            Error::agent(
+                "reuse checkpoint",
+                "retained checkpoint missing; fresh capture refused",
+            )
+        })?;
+    Ok(prepare_forks_with_requirement(db, golden, specs, Some(&retained), true, true, true)?.forks)
+}
+
 /// Prepare a batch, optionally reusing a proven checkpoint that still belongs
 /// to the exact source process. Invalid or stale hints fall back to a fresh
 /// checkpoint; they can never restore state from a restarted source.
@@ -2009,6 +2029,26 @@ pub(crate) fn prepare_forks_reusing(
     retained: Option<&RetainedForkSnapshot>,
     persist_snapshot: bool,
     reuse_live_snapshot: bool,
+) -> Result<PreparedForkBatch> {
+    prepare_forks_with_requirement(
+        db,
+        golden,
+        specs,
+        retained,
+        persist_snapshot,
+        reuse_live_snapshot,
+        false,
+    )
+}
+
+fn prepare_forks_with_requirement(
+    db: &SmolvmDb,
+    golden: &str,
+    specs: &[ForkSpec<'_>],
+    retained: Option<&RetainedForkSnapshot>,
+    persist_snapshot: bool,
+    reuse_live_snapshot: bool,
+    require_retained: bool,
 ) -> Result<PreparedForkBatch> {
     let preparation_started = std::time::Instant::now();
     if specs.is_empty() {
@@ -2051,6 +2091,12 @@ pub(crate) fn prepare_forks_reusing(
     let golden_rec = db
         .get_vm(golden)?
         .ok_or_else(|| Error::vm_not_found(golden))?;
+    if require_retained && !golden_rec.is_process_alive() {
+        return Err(Error::agent(
+            "reuse checkpoint",
+            "source process identity is not live; fresh capture refused",
+        ));
+    }
     #[cfg(target_os = "linux")]
     let mut golden_rec = golden_rec;
     if !golden_rec.staged_mounts.is_empty() {
@@ -2115,18 +2161,17 @@ pub(crate) fn prepare_forks_reusing(
     // be using an older snapshot.
     let snapshot_root = gdir.join("s");
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if fork_continue && !golden_was_paused {
+    if fork_continue && !golden_was_paused && !require_retained {
         recover_uncommitted_generations(db, golden, &gdir, &snapshot_root)?;
     }
-    let reusable = retained.filter(|snapshot| {
-        (golden_was_paused || reuse_live_snapshot)
-            && retained_snapshot_is_reusable(
-                &golden_rec,
-                golden_was_paused,
-                &snapshot_root,
-                snapshot,
-            )
-    });
+    let reusable = select_retained_checkpoint(
+        &golden_rec,
+        golden_was_paused,
+        &snapshot_root,
+        retained,
+        reuse_live_snapshot,
+        require_retained,
+    )?;
     #[cfg(target_os = "linux")]
     let reusable = match (reusable, live_ram_mode) {
         (Some(snapshot), Some(wanted)) if !golden_was_paused => {
@@ -2148,6 +2193,12 @@ pub(crate) fn prepare_forks_reusing(
         }
         (snapshot, _) => snapshot,
     };
+    if require_retained && reusable.is_none() {
+        return Err(Error::agent(
+            "reuse checkpoint",
+            "retained RAM policy differs; fresh capture refused",
+        ));
+    }
     if golden_was_paused && reusable.is_none() {
         return Err(Error::agent(
             "fork",
@@ -2547,6 +2598,27 @@ fn retained_snapshot_is_reusable(
 ) -> bool {
     (golden_was_paused || retained_snapshot_source_continues(snapshot))
         && retained_snapshot_matches_golden(golden, snapshot_root, snapshot)
+}
+
+fn select_retained_checkpoint<'a>(
+    golden: &VmRecord,
+    golden_was_paused: bool,
+    snapshot_root: &Path,
+    retained: Option<&'a RetainedForkSnapshot>,
+    reuse_live_snapshot: bool,
+    require_retained: bool,
+) -> Result<Option<&'a RetainedForkSnapshot>> {
+    let reusable = retained.filter(|snapshot| {
+        (golden_was_paused || reuse_live_snapshot)
+            && retained_snapshot_is_reusable(golden, golden_was_paused, snapshot_root, snapshot)
+    });
+    if require_retained && reusable.is_none() {
+        return Err(Error::agent(
+            "reuse checkpoint",
+            "retained checkpoint missing or stale; fresh capture refused",
+        ));
+    }
+    Ok(reusable)
 }
 
 /// Return whether a retained checkpoint belongs to the exact live golden
@@ -4035,6 +4107,86 @@ mod tests {
                 .cuda_preload_modules
         );
         assert!(!parse_forkpoint_profile(b"cuda-preload-modules-extra\n").cuda_preload_modules);
+    }
+
+    #[test]
+    fn required_checkpoint_rejects_missing_stale_or_unowned_instead_of_capture() -> Result<()> {
+        // Intent: docs/reuse-checkpoint-20260921.md. Files only; no VMM.
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("s");
+        let path = root.join("a1b2c3d4");
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join("source-continues-v1"), b"source-continues-v1\n")?;
+        let snapshot = RetainedForkSnapshot {
+            path,
+            golden_pid: 123,
+            golden_pid_start_time: 456,
+        };
+        let mut golden = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
+        golden.pid = Some(123);
+        golden.pid_start_time = Some(456);
+        assert!(select_retained_checkpoint(&golden, false, &root, None, true, true).is_err());
+        assert_eq!(
+            select_retained_checkpoint(&golden, false, &root, Some(&snapshot), true, true)?,
+            Some(&snapshot)
+        );
+        golden.pid_start_time = Some(457);
+        assert!(
+            select_retained_checkpoint(&golden, false, &root, Some(&snapshot), true, true).is_err()
+        );
+        golden.pid_start_time = Some(456);
+        golden.pid = Some(124);
+        assert!(
+            select_retained_checkpoint(&golden, false, &root, Some(&snapshot), true, true).is_err()
+        );
+        golden.pid = Some(123);
+        std::fs::remove_file(snapshot.path.join("source-continues-v1"))?;
+        assert!(
+            select_retained_checkpoint(&golden, false, &root, Some(&snapshot), true, true).is_err()
+        );
+        assert_eq!(
+            select_retained_checkpoint(&golden, true, &root, Some(&snapshot), true, true)?,
+            Some(&snapshot)
+        );
+        let outside = RetainedForkSnapshot {
+            path: temp.path().to_path_buf(),
+            ..snapshot.clone()
+        };
+        assert!(
+            select_retained_checkpoint(&golden, true, &root, Some(&outside), true, true).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_fork_keeps_fresh_capture_and_pool_keeps_optional_reuse() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("s");
+        let path = root.join("a1b2c3d4");
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join("source-continues-v1"), b"source-continues-v1\n")?;
+        let snapshot = RetainedForkSnapshot {
+            path,
+            golden_pid: 123,
+            golden_pid_start_time: 456,
+        };
+        let mut golden = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
+        golden.pid = Some(123);
+        golden.pid_start_time = Some(456);
+        assert!(
+            select_retained_checkpoint(&golden, false, &root, Some(&snapshot), false, false)?
+                .is_none()
+        );
+        assert_eq!(
+            select_retained_checkpoint(&golden, false, &root, Some(&snapshot), true, false)?,
+            Some(&snapshot)
+        );
+        golden.pid_start_time = Some(457);
+        assert!(
+            select_retained_checkpoint(&golden, false, &root, Some(&snapshot), true, false)?
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

@@ -840,6 +840,7 @@ pub fn forkable_launch() -> ForkLaunch {
 /// clones exist), copy-on-write clones its disks, and boots the clone from the
 /// golden's in-memory checkpoint.
 pub struct ForkVmOptions<'a> {
+    pub reuse_checkpoint: bool,
     pub clone_forkable: bool,
     pub pinned_ports: &'a [(u16, u16)],
     pub share_weights: bool,
@@ -880,12 +881,33 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     // Freeze + snapshot the golden, register the clone (CoW disks + DB record).
     // The launch-agnostic mechanics live in the lib (`agent::fork`) so the CLI
     // and the serve API share one implementation.
-    if smolvm::agent::fork::fork_continue_enabled() {
+    if options.reuse_checkpoint {
+        eprintln!("Reusing '{golden}' retained checkpoint; fresh capture is forbidden...");
+    } else if smolvm::agent::fork::fork_continue_enabled() {
         eprintln!("Checkpointing '{golden}' while keeping it running...");
     } else {
         eprintln!("Freezing source '{golden}' as branch base...");
     }
-    let prep = if options.hold {
+    let prep = if options.reuse_checkpoint {
+        let mut prepared = smolvm::agent::fork::prepare_forks_from_checkpoint(
+            &db,
+            golden,
+            &[smolvm::agent::fork::ForkSpec {
+                clone,
+                pinned_ports: options.pinned_ports,
+                clone_forkable: options.clone_forkable,
+                fork_env: options.fork_env,
+                fork_secrets: options.fork_secrets,
+                hold: options.hold,
+            }],
+        )?;
+        prepared.pop().ok_or_else(|| {
+            smolvm::Error::agent(
+                "reuse checkpoint",
+                "single child preparation returned no child",
+            )
+        })?
+    } else if options.hold {
         smolvm::agent::fork::prepare_held_fork(
             &db,
             golden,
@@ -955,6 +977,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
 /// has booted, received a fresh identity, and received its per-clone env.
 /// How a batch of children is created from one checkpoint.
 pub struct ForkBatchOptions<'a> {
+    pub reuse_checkpoint: bool,
     pub share_weights: bool,
     pub fork_secrets: &'a BTreeMap<String, SecretRef>,
     pub wait_ready: Option<std::time::Duration>,
@@ -971,6 +994,7 @@ pub fn fork_vm_batch(
     options: ForkBatchOptions<'_>,
 ) -> smolvm::Result<()> {
     let ForkBatchOptions {
+        reuse_checkpoint,
         share_weights,
         fork_secrets,
         wait_ready,
@@ -1016,7 +1040,12 @@ pub fn fork_vm_batch(
             hold,
         })
         .collect();
-    if smolvm::agent::fork::fork_continue_enabled() {
+    if reuse_checkpoint {
+        eprintln!(
+            "Reusing '{golden}' retained checkpoint for {} clones; fresh capture is forbidden...",
+            clones.len()
+        );
+    } else if smolvm::agent::fork::fork_continue_enabled() {
         eprintln!(
             "Checkpointing '{golden}' once for {} clones while keeping it running...",
             clones.len()
@@ -1027,7 +1056,11 @@ pub fn fork_vm_batch(
             clones.len()
         );
     }
-    let prepared = smolvm::agent::fork::prepare_forks(&db, golden, &specs)?;
+    let prepared = if reuse_checkpoint {
+        smolvm::agent::fork::prepare_forks_from_checkpoint(&db, golden, &specs)?
+    } else {
+        smolvm::agent::fork::prepare_forks(&db, golden, &specs)?
+    };
     let snapshot_dir = prepared[0].snapshot_dir.clone();
     let all_names: Vec<String> = clones.iter().map(|(name, _)| name.clone()).collect();
     let jobs: Vec<_> = prepared
