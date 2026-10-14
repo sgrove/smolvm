@@ -1040,6 +1040,26 @@ impl VmRecord {
 mod tests {
     use super::*;
 
+    // A record written before `--dns-option` existed still loads (no options),
+    // and a record's options reach the launch resources in order.
+    #[test]
+    fn dns_options_persist_on_the_record_and_reach_launch_resources() {
+        let mut record = VmRecord::new("d".to_string(), 1, 512, vec![], vec![], true);
+        let mut old = serde_json::to_value(&record).unwrap();
+        assert!(
+            old.get("dns_options").is_none(),
+            "empty options are not written"
+        );
+        old.as_object_mut().unwrap().remove("dns_options");
+        let loaded: VmRecord = serde_json::from_value(old).unwrap();
+        assert!(loaded.dns_options.is_empty());
+
+        record.dns_options = vec!["timeout:1".into(), "use-vc".into()];
+        let loaded: VmRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        assert_eq!(loaded.vm_resources().dns_options, ["timeout:1", "use-vc"]);
+    }
+
     /// A machine with `image`, and whatever networking the args describe.
     fn rec_with_image(image: &str, network: bool, ports: Vec<(u16, u16)>) -> VmRecord {
         let mut r = VmRecord::new("m".to_string(), 1, 512, vec![], ports, network);

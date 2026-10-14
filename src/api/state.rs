@@ -1670,6 +1670,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         // Custom DNS is a local-CLI feature for now; the cloud ResourceSpec
         // does not expose it, so API-launched VMs inherit the backend default.
         dns: None,
+        dns_options: Vec::new(),
         network_name: None,
     }
 }

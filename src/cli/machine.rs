@@ -1263,6 +1263,8 @@ impl RunCmd {
         )?;
 
         let mut params = params;
+        // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
+        params.dns_options = self.dns_option.clone();
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;
@@ -2408,6 +2410,46 @@ mod tests {
     }
 
     #[test]
+    fn create_takes_repeatable_dns_options_in_order_and_refuses_unknown_ones() {
+        let cli = TestMachineCli::try_parse_from([
+            "machine",
+            "create",
+            "--name",
+            "dns-1",
+            "--dns-option",
+            "timeout:1",
+            "--dns-option",
+            "attempts:3",
+            "--dns-option",
+            "rotate",
+            "--dns-option",
+            "use-vc",
+        ])
+        .unwrap();
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create");
+        };
+        assert_eq!(
+            cmd.dns_option,
+            ["timeout:1", "attempts:3", "rotate", "use-vc"]
+        );
+        for bad in ["bogus", "timeout:0", "rotate:1", "options timeout:1"] {
+            assert!(
+                TestMachineCli::try_parse_from([
+                    "machine",
+                    "create",
+                    "--name",
+                    "dns-2",
+                    "--dns-option",
+                    bad
+                ])
+                .is_err(),
+                "{bad:?} must be refused at the command line"
+            );
+        }
+    }
+
+    #[test]
     fn create_accepts_port_ranges() {
         let cli = TestMachineCli::parse_from([
             "machine",
@@ -3497,6 +3539,8 @@ impl CreateCmd {
             smolvm::util::parse_labels(&self.labels)?,
         )?;
         let mut params = params;
+        // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
+        params.dns_options = self.dns_option.clone();
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
         params.nested_virt = params.nested_virt || self.nested_virt;

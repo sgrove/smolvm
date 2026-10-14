@@ -272,3 +272,32 @@ mod display_size_tests {
         assert_eq!(parse_display_size(Some("1920x99999")), None);
     }
 }
+
+#[cfg(test)]
+mod guest_network_env_tests {
+    use super::guest_network_env;
+    use smolvm_protocol::guest_env;
+
+    fn value(env: &[std::ffi::CString], key: &str) -> Option<String> {
+        env.iter()
+            .filter_map(|entry| entry.to_str().ok())
+            .find_map(|entry| entry.strip_prefix(&format!("{key}=")).map(str::to_string))
+    }
+
+    // `--dns-option` reaches the agent as one ordered, space-separated value;
+    // with none set, the variable is absent (the agent then writes no
+    // `options` line, the pre-flag file).
+    #[test]
+    fn dns_options_travel_in_order_only_when_set() {
+        let options = ["timeout:1", "attempts:3", "rotate", "use-vc"].map(String::from);
+        let env = guest_network_env(None, None, &options);
+        assert_eq!(
+            value(&env, guest_env::DNS_OPTIONS).as_deref(),
+            Some("timeout:1 attempts:3 rotate use-vc")
+        );
+        assert_eq!(
+            value(&guest_network_env(None, None, &[]), guest_env::DNS_OPTIONS),
+            None
+        );
+    }
+}
