@@ -4188,6 +4188,9 @@ impl CreateCmd {
                 &smolvm::agent::machine_layers_cache_dir(&name_for_layers),
             );
             let data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
+            // Extracted packs keep read-only directories; make the tree
+            // removable before removing it.
+            let _ = smolvm::portable_checkpoint::make_tree_owner_writable(&data_dir);
             if let Err(remove_err) = std::fs::remove_dir_all(&data_dir) {
                 if remove_err.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(

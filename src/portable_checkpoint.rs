@@ -2594,6 +2594,31 @@ pub fn install_cold_disks(
     result
 }
 
+/// Give the owner write+search permission on every directory under `root`
+/// (not following symlinks), so the tree can be removed. Absent is fine.
+pub fn make_tree_owner_writable(root: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = match std::fs::symlink_metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_dir() {
+            return Ok(());
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode | 0o700))?;
+        }
+        for entry in std::fs::read_dir(root)? {
+            make_tree_owner_writable(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// Remove the extracted pack used only to transport a portable checkpoint.
 ///
 /// All checkpoint state and disk chains have their own links or private copies
@@ -2605,6 +2630,12 @@ pub fn install_cold_disks(
 pub fn discard_transport_pack(vm_data_dir: &Path) -> Result<()> {
     let pack_dir = vm_data_dir.join("pack");
     smolvm_pack::extract::force_detach_layers_volume(&pack_dir);
+    // The extracted agent rootfs keeps its packed modes, including read-only
+    // (`r-x`) directories, which a plain recursive remove cannot empty
+    // (EACCES on unlink inside them). Make every directory owner-writable
+    // first; symlinks are never followed.
+    make_tree_owner_writable(&pack_dir)
+        .map_err(|error| Error::agent("discard checkpoint transport pack", error.to_string()))?;
     match std::fs::remove_dir_all(&pack_dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -3159,6 +3190,28 @@ mod tests {
         let mut incompatible = metadata;
         incompatible.runtime_abi.push_str("-other");
         assert!(validate_compatibility(&incompatible).is_err());
+    }
+
+    #[test]
+    fn a_transport_pack_with_read_only_directories_is_discarded() {
+        use std::os::unix::fs::PermissionsExt;
+        let machine = tempfile::tempdir().unwrap();
+        let bin = machine.path().join("pack/agent-rootfs/usr/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("hardlink"), b"x").unwrap();
+        std::os::unix::fs::symlink("/etc", machine.path().join("pack/agent-rootfs/etc-link"))
+            .unwrap();
+        for dir in [bin.clone(), bin.parent().unwrap().to_path_buf()] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        // A plain recursive remove fails exactly as the studio-a import did.
+        assert!(std::fs::remove_dir_all(machine.path().join("pack")).is_err());
+        discard_transport_pack(machine.path()).unwrap();
+        assert!(!machine.path().join("pack").exists());
+        // The symlink's target was never touched.
+        assert!(std::path::Path::new("/etc").is_dir());
+        // Absent is fine.
+        discard_transport_pack(machine.path()).unwrap();
     }
 
     #[test]
