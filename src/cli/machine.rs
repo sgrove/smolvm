@@ -2410,6 +2410,40 @@ mod tests {
     }
 
     #[test]
+    fn create_cold_disks_parses_the_fleet_import_and_requires_from() {
+        // The exact argv the fleet's parent import issues, plus resolver options.
+        let cli = TestMachineCli::try_parse_from([
+            "machine",
+            "create",
+            "--name",
+            "lane-parent",
+            "--from",
+            "/x/warm-parent.smolcheckpoint",
+            "--cold-disks",
+            "--dns-option",
+            "use-vc",
+            "--",
+            "/bin/sleep",
+            "infinity",
+        ])
+        .unwrap();
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create");
+        };
+        assert!(cmd.cold_disks);
+        assert_eq!(cmd.dns_option, ["use-vc"]);
+        assert_eq!(cmd.command, ["/bin/sleep", "infinity"]);
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "create",
+            "--name",
+            "no-from",
+            "--cold-disks",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn create_takes_repeatable_dns_options_in_order_and_refuses_unknown_ones() {
         let cli = TestMachineCli::try_parse_from([
             "machine",
@@ -3496,6 +3530,13 @@ pub struct CreateCmd {
     #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
     pub from: Option<PathBuf>,
 
+    /// With `--from <.smolcheckpoint>`: import only the checkpoint's captured
+    /// storage and overlay disks and boot them cold on `start` (no captured
+    /// RAM, vCPU or device state). The machine's resources and resolver
+    /// options (`--cpus`, `--mem`, `--dns-option`) apply to the cold boot.
+    #[arg(long = "cold-disks", requires = "from")]
+    pub cold_disks: bool,
+
     /// Command to run as the machine's persistent workload (image machines).
     /// Launched as a detached container on every `start`, so it stays running
     /// (e.g. a pre-warmed browser to be branched). Without this, the image's own
@@ -3709,7 +3750,22 @@ impl CreateCmd {
                 .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?
         };
         let checkpoint = manifest.checkpoint.clone();
-        if let Some(ref checkpoint) = checkpoint {
+        if self.cold_disks && checkpoint.is_none() {
+            return Err(smolvm::Error::config(
+                "create --cold-disks",
+                "--cold-disks imports a .smolcheckpoint's disks; this artifact has no checkpoint",
+            ));
+        }
+        // A live restore resumes the captured RAM and devices; a cold import
+        // boots only the captured disks from a fresh kernel.
+        let live = !self.cold_disks;
+        if self.cold_disks && (self.storage.is_some() || self.overlay.is_some()) {
+            return Err(smolvm::Error::config(
+                "create --cold-disks",
+                "the captured disks keep their captured sizes; --storage/--overlay are not supported",
+            ));
+        }
+        if let Some(checkpoint) = checkpoint.as_ref().filter(|_| live) {
             smolvm::portable_checkpoint::validate_compatibility(checkpoint)?;
             let topology_overridden = !self.volume.is_empty()
                 || !self.port.is_empty()
@@ -3794,7 +3850,7 @@ impl CreateCmd {
         // including when it equals the default.
         let cpus = self.cpus.unwrap_or(manifest.cpus);
         let mem = self.mem.unwrap_or(manifest.mem);
-        if let Some(ref checkpoint) = checkpoint {
+        if let Some(checkpoint) = checkpoint.as_ref().filter(|_| live) {
             if cpus != checkpoint.cpus || mem != checkpoint.memory_mib {
                 return Err(smolvm::Error::config(
                     "create from .smolcheckpoint",
@@ -3952,7 +4008,7 @@ impl CreateCmd {
             cuda: self.cuda || self.auto_graph,
             // A restored durable checkpoint remains eligible to become a new
             // fork/checkpoint source without a topology-changing restart.
-            forkable: checkpoint.is_some(),
+            forkable: checkpoint.is_some() && live,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,
@@ -3997,10 +4053,13 @@ impl CreateCmd {
 
         let mut record = vm_common::build_vm_record(&params)?;
         if checkpoint.is_some() {
-            record.host_uid_owner = Some(record.name.clone());
-            // The restored RAM already contains the initialized guest and its
-            // running workload. Re-running image pull/init after resume would
-            // duplicate side effects and violate checkpoint semantics.
+            if live {
+                record.host_uid_owner = Some(record.name.clone());
+            }
+            // The restored RAM (live) or the captured disks (cold) already
+            // contain the initialized guest and its container overlay.
+            // Re-running image pull/init would duplicate side effects and, for
+            // a cold import, overwrite the prepared rootfs.
             record.init_completed = true;
             record.user = checkpoint
                 .as_ref()
@@ -4104,7 +4163,19 @@ impl CreateCmd {
 
             if let Some(ref checkpoint) = checkpoint {
                 let vm_data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
-                smolvm::portable_checkpoint::install(&pack_content_dir, &vm_data_dir, checkpoint)?;
+                if live {
+                    smolvm::portable_checkpoint::install(
+                        &pack_content_dir,
+                        &vm_data_dir,
+                        checkpoint,
+                    )?;
+                } else {
+                    smolvm::portable_checkpoint::install_cold_disks(
+                        &pack_content_dir,
+                        &vm_data_dir,
+                        checkpoint,
+                    )?;
+                }
                 smolvm::portable_checkpoint::discard_transport_pack(&vm_data_dir)?;
             }
 

@@ -2517,6 +2517,83 @@ pub fn install(
     result
 }
 
+/// Install only a checkpoint's captured disk chains, for a cold boot.
+///
+/// This is the fleet's `machine create --from <checkpoint> --cold-disks`
+/// import: the machine boots its captured storage and overlay disks from a
+/// fresh kernel on `start`, so no RAM, vCPU or device state is installed and
+/// no restore is pending. Because nothing about the captured live state is
+/// reused, the runtime ABI and CPU contract need not match the capturing
+/// host; the disk chains are verified exactly as [`install`] verifies them.
+pub fn install_cold_disks(
+    extracted: &Path,
+    vm_data_dir: &Path,
+    checkpoint: &PortableCheckpointManifest,
+) -> Result<()> {
+    validate_disk_manifest(&checkpoint.disks)?;
+    let partial = vm_data_dir.join(format!(".cold-disks-{}-partial", std::process::id()));
+    let _ = std::fs::remove_dir_all(&partial);
+    std::fs::create_dir(&partial)
+        .map_err(|error| Error::agent("stage cold checkpoint disks", error.to_string()))?;
+    let result = (|| -> Result<()> {
+        for disk in &checkpoint.disks {
+            for (index, file) in disk.files.iter().enumerate() {
+                let staged = partial.join(&file.target);
+                let source = extracted.join(&file.asset.path);
+                if index == 0 {
+                    // The top layer becomes the machine's writable disk.
+                    copy_verified_sparse(&source, &staged, &file.asset)?;
+                } else {
+                    link_or_copy_verified_sparse(&source, &staged, &file.asset)?;
+                }
+                if file.format == "qcow2" {
+                    let (backing, _) = inspect_qcow2(&staged)?;
+                    let expected_backing =
+                        disk.files.get(index + 1).map(|next| next.target.as_str());
+                    if backing.as_deref() != expected_backing {
+                        return Err(Error::agent(
+                            "install cold checkpoint disks",
+                            format!(
+                                "qcow2 '{}' references {:?}, expected {:?}",
+                                file.target, backing, expected_backing
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        for raw_name in [
+            crate::storage::STORAGE_DISK_FILENAME,
+            crate::storage::OVERLAY_DISK_FILENAME,
+        ] {
+            for path in [
+                vm_data_dir.join(raw_name),
+                vm_data_dir.join(Path::new(raw_name).with_extension("qcow2")),
+            ] {
+                if path.exists() {
+                    std::fs::remove_file(&path).map_err(|error| {
+                        Error::agent("replace cold checkpoint disk", error.to_string())
+                    })?;
+                }
+            }
+        }
+        for disk in &checkpoint.disks {
+            for file in &disk.files {
+                std::fs::rename(partial.join(&file.target), vm_data_dir.join(&file.target))
+                    .map_err(|error| {
+                        Error::agent("publish cold checkpoint disk", error.to_string())
+                    })?;
+            }
+            std::fs::write(vm_data_dir.join(format!("{}.formatted", disk.role)), b"1").map_err(
+                |error| Error::agent("mark cold checkpoint disk formatted", error.to_string()),
+            )?;
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&partial);
+    result
+}
+
 /// Remove the extracted pack used only to transport a portable checkpoint.
 ///
 /// All checkpoint state and disk chains have their own links or private copies
@@ -3082,6 +3159,84 @@ mod tests {
         let mut incompatible = metadata;
         incompatible.runtime_abi.push_str("-other");
         assert!(validate_compatibility(&incompatible).is_err());
+    }
+
+    #[test]
+    fn cold_disks_install_only_the_disk_chains_and_leave_no_restore_pending() {
+        let extracted = tempfile::tempdir().unwrap();
+        let source = extracted.path().join(ASSET_DIR);
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("checkpoint.bin"), b"state").unwrap();
+        std::fs::write(source.join("memory.bin"), b"memory").unwrap();
+        std::fs::write(source.join("manifest.bin"), b"layout").unwrap();
+        for role in ["storage", "overlay"] {
+            let disk_dir = source.join("disks").join(role);
+            std::fs::create_dir_all(&disk_dir).unwrap();
+            std::fs::write(disk_dir.join("0"), format!("{role}-disk")).unwrap();
+        }
+        let disk = |role: &str, target: &str| CheckpointDisk {
+            role: role.to_string(),
+            files: vec![CheckpointDiskFile {
+                asset: describe_sparse_asset(
+                    &source.join("disks").join(role).join("0"),
+                    &format!("checkpoint/disks/{role}/0"),
+                )
+                .unwrap(),
+                target: target.to_string(),
+                format: "raw".to_string(),
+            }],
+        };
+        let mut metadata = PortableCheckpointManifest {
+            version: FORMAT_VERSION,
+            runtime_abi: RUNTIME_ABI.to_string(),
+            host_platform: crate::platform::Platform::current()
+                .host_oci_platform()
+                .to_string(),
+            cpu_contract: checkpoint_cpu_contract().unwrap(),
+            cpus: 2,
+            memory_mib: 512,
+            storage_gib: None,
+            overlay_gib: None,
+            device_profile: DEVICE_PROFILE.to_string(),
+            state: describe_asset(&source.join("checkpoint.bin"), "checkpoint/checkpoint.bin")
+                .unwrap(),
+            memory: describe_sparse_asset(&source.join("memory.bin"), "checkpoint/memory.bin")
+                .unwrap(),
+            layout: describe_asset(&source.join("manifest.bin"), "checkpoint/manifest.bin")
+                .unwrap(),
+            disks: vec![
+                disk("storage", "storage.raw"),
+                disk("overlay", "overlay.raw"),
+            ],
+            workload: None,
+            network: Some(CheckpointNetwork::default()),
+        };
+        // A cold boot reuses no live state, so a checkpoint captured under a
+        // different runtime ABI still imports its disks.
+        metadata.runtime_abi.push_str("-other");
+        let machine = tempfile::tempdir().unwrap();
+        std::fs::write(machine.path().join("storage.qcow2"), b"default").unwrap();
+        install_cold_disks(extracted.path(), machine.path(), &metadata).unwrap();
+        assert_eq!(
+            std::fs::read(machine.path().join("storage.raw")).unwrap(),
+            b"storage-disk"
+        );
+        assert_eq!(
+            std::fs::read(machine.path().join("overlay.raw")).unwrap(),
+            b"overlay-disk"
+        );
+        assert!(!machine.path().join("storage.qcow2").exists());
+        assert!(machine.path().join("storage.formatted").is_file());
+        assert!(machine.path().join("overlay.formatted").is_file());
+        assert!(pending_dir(machine.path()).is_none(), "no restore is pending");
+        assert!(!machine.path().join(INSTALLED_DIR).exists());
+        // A disk whose bytes differ from the manifest is refused.
+        std::fs::write(source.join("disks/overlay/0"), b"tampered-overlay-disk").unwrap();
+        let again = tempfile::tempdir().unwrap();
+        assert!(install_cold_disks(extracted.path(), again.path(), &metadata).is_err());
+        // Staging fails before anything is published into the machine.
+        assert!(!again.path().join("storage.raw").exists());
+        assert!(!again.path().join("overlay.raw").exists());
     }
 
     #[cfg(target_os = "linux")]
