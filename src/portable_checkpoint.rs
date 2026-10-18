@@ -3228,7 +3228,10 @@ mod tests {
         assert!(!machine.path().join("storage.qcow2").exists());
         assert!(machine.path().join("storage.formatted").is_file());
         assert!(machine.path().join("overlay.formatted").is_file());
-        assert!(pending_dir(machine.path()).is_none(), "no restore is pending");
+        assert!(
+            pending_dir(machine.path()).is_none(),
+            "no restore is pending"
+        );
         assert!(!machine.path().join(INSTALLED_DIR).exists());
         // A disk whose bytes differ from the manifest is refused.
         std::fs::write(source.join("disks/overlay/0"), b"tampered-overlay-disk").unwrap();
